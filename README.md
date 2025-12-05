@@ -1,211 +1,172 @@
-🐶 Dog Collar Backend — Express + PostgreSQL + IMU Processing
+Dog Collar Backend — Express + PostgreSQL + IMU Processing
 
-Full API + Architecture Documentation
+This backend powers a smart dog collar system with collar management, session tracking, IMU chunk ingestion, step counting, and temperature history reconstruction.
 
-📌 Overview
+Features
 
-This backend provides:
+Create and update dog collars
 
-Collar creation & management
+Session system (multiple sessions per collar)
 
-Composite session system (multiple sessions per collar)
+Upload IMU chunks (accelerometer, gyro, temperature)
 
-IMU chunk ingestion (accelerometer + gyro + temperature)
+Step counting using a custom algorithm
 
-Step counting algorithm (zero-cross, gravity alignment, filtering)
+Temperature timeline reconstruction
 
-Temperature history expansion
+Timestamp alignment using real_time + start_sample
 
-Per-chunk and cumulative metrics
+Per-chunk and cumulative metrics storage
 
-Timestamp alignment (real_time + start_sample mapping)
+Tech Stack
 
-🏗 Tech Stack
+Node.js
 
-Node.js + Express
+Express
 
-PostgreSQL (Neon / RDS / Local)
+PostgreSQL
 
-In-memory StepCounter per collar
+Custom IMU decoder
 
-Base64 → IMU binary decoder
+In-memory StepCounter
 
-Chunk storage + metrics pipeline
+Installation
+git clone https://github.com/your-username/dog-collar-backend.git
+cd dog-collar-backend
+npm install
 
-🚀 API Endpoints
-1️⃣ POST /collars — Create or Update Collar
-Create collar
-curl "http://localhost:3000/collars" `
-  -Method POST `
-  -Headers @{ "Content-Type" = "application/json" } `
-  -Body '{
-    "collar_id": "C001",
-    "dog_name": "Bruno",
-    "breed": "Labrador"
-  }'
 
-Create collar + new session
-curl "http://localhost:3000/collars" `
-  -Method POST `
-  -Headers @{ "Content-Type" = "application/json" } `
-  -Body '{
-    "collar_id": "C001",
-    "new_session": true
-  }'
+Create a .env file:
 
-Behavior
-Scenario	Result
-Collar does not exist	Created
-Collar exists	Updated (only dog_name unless extended)
-new_session = true	New session created + returned
-2️⃣ PUT /chunks — Upload IMU + Temperature Chunk
-Normal chunk upload (uses active session)
-curl "http://localhost:3000/chunks" `
-  -Method PUT `
-  -Headers @{ "Content-Type" = "application/json" } `
-  -Body '{
-    "data": {
-      "chunk_00000000": {
-        "collar_id": "C001",
-        "imu_data": "BASE64_DATA_HERE",
-        "temp_data": [29.57, 29.51, 29.37],
-        "temp_first_timestamp": "2025-12-05T20:21:26+05:30"
-      }
-    }
-  }'
+DATABASE_URL=your-postgres-connection-url
+PORT=3000
 
-Create new session + upload chunk
+
+Run the server:
+
+node app.js
+
+API Endpoints
+1. POST /collars
+
+Create or update a collar.
+A new session is created only when new_session: true is included.
+
+Example
+{
+  "collar_id": "C001",
+  "dog_name": "Bruno",
+  "new_session": true
+}
+
+2. PUT /chunks
+
+Uploads an IMU + temperature chunk.
+
+Requires an active session unless new_session: true is sent.
+
+Example
 {
   "new_session": true,
   "data": {
-    "chunk_xxxx": {
+    "chunk_0001": {
       "collar_id": "C001",
-      "imu_data": "...",
-      "temp_data": [...],
-      "temp_first_timestamp": "..."
+      "imu_data": "BASE64_STRING",
+      "temp_data": [29.5, 29.4],
+      "temp_first_timestamp": "2025-12-05T20:21:26Z",
+      "real_time": "2025-12-05T20:21:26Z",
+      "start_sample": 0
     }
   }
 }
 
-Error if no session exists
-{
-  "error": "No active session. Call PUT /chunks with {new_session: true}"
-}
+3. GET /collars
 
-3️⃣ GET /collars/:collar_id — Full Collar + Temperature History
-curl "http://localhost:3000/collars/C001"
+Returns a list of all collars.
+
+4. GET /collars/:collar_id
+
+Returns the collar details and reconstructed temperature history.
 
 Example Response
 {
   "collar_id": "C001",
   "dog_name": "Bruno",
-  "breed": "Labrador",
   "temperature_list": [
     { "temp_c": 29.57, "timestamp": "2025-12-05T20:21:26Z" },
-    { "temp_c": 29.51, "timestamp": "2025-12-05T20:21:27Z" },
-    { "temp_c": 29.37, "timestamp": "2025-12-05T20:21:28Z" }
+    { "temp_c": 29.51, "timestamp": "2025-12-05T20:21:27Z" }
   ]
 }
 
-4️⃣ GET /collars — List All Collars
-curl http://localhost:3000/collars
+5. GET /dog/:collar_id
 
-5️⃣ GET /dog/:collar_id — Dog Profile Only
-curl http://localhost:3000/dog/C001
+Returns dog-only profile information.
 
-6️⃣ GET /metrics/:collar_id — Steps + Latest Chunk Data
+Session Logic
 
-(If implemented in your version)
+Sessions are not created automatically.
 
-🧠 System Behavior Summary
-⭐ Session Handling Logic
-Action	Creates New Session?	Notes
-POST /collars	❌	Unless new_session=true
-POST /collars { new_session: true }	✅	New active session returned
-PUT /chunks	❌	Rejects if no active session
-PUT /chunks { new_session: true }	✅	Creates new session before processing
-⭐ Temperature Handling
+Sessions are created only when:
 
-Each chunk may include:
+POST /collars includes "new_session": true
+
+PUT /chunks includes "new_session": true
+
+Only one session can be active at a time.
+
+Chunk uploads without an active session return an error.
+
+Temperature Processing
+
+Each chunk includes:
 
 temp_data[]
 
 temp_first_timestamp
 
-Backend expands:
+Timestamps are reconstructed as:
 
-timestamp = temp_first_timestamp + index * 1 second
-
-
-All temps from all chunks aggregated into:
-
-temperature_list[]
+timestamp[i] = temp_first_timestamp + (i * 1000ms)
 
 
-Returned in GET /collars/:id.
+All chunk temperatures are merged into temperature_list.
 
-⭐ Step Counter Pipeline
+Step Counting Algorithm
 
-Base64 decode → IMU sample array
+Processing pipeline:
 
-Gravity smoothing filter
+Decode IMU base64
 
-Rotational alignment to Z-axis
+Gravity smoothing
+
+Rotate sample to global Z-axis
 
 DV filtering
 
-Zero-line sliding window
+Zero-line estimation
 
 Falling zero-cross detection
 
-Frequency check (2.25–3.75 Hz)
+Frequency validation (2.25–3.75 Hz)
 
-Require minimum in-band streak
+Step increment
 
-Increase cumulative step_count
+Store steps per chunk and cumulative steps
 
-Database stores:
+Database Tables
+collars
 
-steps in chunk
+Stores collar info + metrics.
 
-cumulative steps
+collar_sessions
 
-last_chunk_id
+Tracks active and inactive sessions.
 
-last_update timestamp
+collar_chunks
 
-🗄 Database Writes
-Operation	Table
-Collar create/update	collars
-New session	collar_sessions
-Chunk ingestion	collar_chunks
-Step metric update	collars.output_metric
-🔧 Local Development
-Install dependencies
-npm install
+Stores IMU data, temperature, timestamps, and metrics.
 
-Run Server
-node app.js
-
-
-Make sure your environment has:
-
-DATABASE_URL=postgresql://...
-PORT=3000
-
-📦 Project Structure
-/app.js
-/README.md
-/package.json
-
-🧩 Future Improvements (Optional)
-
-Swagger / OpenAPI documentation
-
-Admin dashboard for viewing collars + sessions
-
-Charting step history + temperature history
-
-Add Redis cache for StepCounters
-
-Merge sessions and chunks into timeline view
+Project Structure
+app.js
+package.json
+README.md
