@@ -28,6 +28,21 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 const app = express();
+
+// Enable CORS for all origins
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  
+  next();
+});
+
 app.use(bodyParser.json({ limit: '20mb' }));
 
 /* -----------------------------
@@ -618,6 +633,7 @@ app.get('/collars', async (req, res) => {
 app.get('/collars/:collar_id', async (req, res) => {
   try {
     const cid = req.params.collar_id;
+    const sessionId = req.query.session_id;  // Optional: filter by session
 
     // Fetch collar basic data
     const collarRes = await pool.query(
@@ -631,14 +647,27 @@ app.get('/collars/:collar_id', async (req, res) => {
 
     const collar = collarRes.rows[0];
 
-    // Fetch ALL temperature readings from chunks
-    const chunksRes = await pool.query(
-      `SELECT temp_data, temp_first_timestamp
-       FROM collar_chunks
-       WHERE collar_id = $1
-       ORDER BY created_at ASC`,
-      [cid]
-    );
+    // Fetch temperature readings - optionally filtered by session_id
+    let chunksRes;
+    if (sessionId) {
+      // Get temperature data ONLY for this specific session
+      chunksRes = await pool.query(
+        `SELECT temp_data, temp_first_timestamp
+         FROM collar_chunks
+         WHERE collar_id = $1 AND session_id = $2
+         ORDER BY created_at ASC`,
+        [cid, sessionId]
+      );
+    } else {
+      // Get ALL temperature readings from chunks (backward compatibility)
+      chunksRes = await pool.query(
+        `SELECT temp_data, temp_first_timestamp
+         FROM collar_chunks
+         WHERE collar_id = $1
+         ORDER BY created_at ASC`,
+        [cid]
+      );
+    }
 
     const temperature_list = [];
 
