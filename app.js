@@ -178,7 +178,7 @@ const mappingByCollar = new Map();
 /* -----------------------------
    Sessions helpers (collar_sessions table)
    ----------------------------- */
-async function generateAndInsertSession(collar_id, created_by = 'api') {
+async function generateAndInsertSession(collar_id, created_by = 'api', dogMetadata = {}) {
   const client = await pool.connect();
   try {
     const { rows } = await client.query(
@@ -205,8 +205,8 @@ async function generateAndInsertSession(collar_id, created_by = 'api') {
       [collar_id]
     );
     await client.query(
-      'INSERT INTO collar_sessions (collar_id, session_id, active, created_by, created_at) VALUES ($1,$2,TRUE,$3,NOW())',
-      [collar_id, session_id, created_by]
+      'INSERT INTO collar_sessions (collar_id, session_id, active, created_by, dog_metadata, created_at) VALUES ($1,$2,TRUE,$3,$4,NOW())',
+      [collar_id, session_id, created_by, JSON.stringify(dogMetadata)]
     );
     await client.query('COMMIT');
     return session_id;
@@ -523,21 +523,39 @@ app.post('/collars', async (req, res) => {
       return res.status(400).json({ error: 'collar_id required' });
     }
 
-    // Create or update collar
-    const collar = await upsertCollarCreateOnly(body);
-
     // ⭐ Create new session when user explicitly asks
     if (body.new_session === true || body.new_session === "true" || body.new_session === 1) {
-      const session_id = await generateAndInsertSession(body.collar_id, 'user_request');
+      // FIRST: Update collar with new dog details
+      const collar = await upsertCollarCreateOnly(body);
+
+      // THEN: Capture dog details as snapshot for this session
+      const dogMetadata = {
+        dog_name: collar.dog_name,
+        breed: collar.breed,
+        age: collar.age,
+        height: collar.height,
+        weight: collar.weight,
+        sex: collar.sex,
+        coat_type: collar.coat_type,
+        temperature_irgun: collar.temperature_irgun,
+        collar_orientation: collar.collar_orientation,
+        medical_info: collar.medical_info,
+        remarks: collar.remarks
+      };
+
+      // Create new session with updated dog metadata snapshot
+      const session_id = await generateAndInsertSession(body.collar_id, 'user_request', dogMetadata);
       return res.json({
         ok: true,
         collar,
-        session_id   // ALWAYS return
+        session_id,
+        message: 'Dog details updated and new session created with snapshot.'
       });
     }
 
-    // default
-    return res.json({ ok: true, collar });
+    // Default: Update collar details WITHOUT creating a new session
+    const collar = await upsertCollarCreateOnly(body);
+    return res.json({ ok: true, collar, message: 'Dog details updated' });
 
   } catch (err) {
     console.error('POST /collars error', err);
@@ -704,7 +722,21 @@ app.put('/chunks', async (req, res) => {
 
     // ✔ Only create new session IF user explicitly asks
     if (new_session === true) {
-      session_id = await generateAndInsertSession(collar_id, "manual");
+      // Fetch current dog metadata from collar table
+      const dogMetadata = {
+        dog_name: collarRows[0].dog_name,
+        breed: collarRows[0].breed,
+        age: collarRows[0].age,
+        height: collarRows[0].height,
+        weight: collarRows[0].weight,
+        sex: collarRows[0].sex,
+        coat_type: collarRows[0].coat_type,
+        temperature_irgun: collarRows[0].temperature_irgun,
+        collar_orientation: collarRows[0].collar_orientation,
+        medical_info: collarRows[0].medical_info,
+        remarks: collarRows[0].remarks
+      };
+      session_id = await generateAndInsertSession(collar_id, "manual", dogMetadata);
     }
 
     // ❌ Do NOT create session automatically
