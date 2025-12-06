@@ -44,17 +44,20 @@ node app.js
 API Endpoints
 1. POST /collars
 
-Create or update a collar.
-A new session is created only when new_session: true is included.
+Create or update a collar. When `new_session: true` is included:
+- Updates the collar with new dog details
+- Creates a new session with a snapshot of those details
+- Stores historical record of dog metadata at time of session creation
 
-Example (Create collar with new session)
+Example (Update dog details AND create new session)
+```json
 {
   "collar_id": "C001",
   "dog_name": "Bruno",
   "breed": "Labrador",
-  "age": 3,
+  "age": 5,
   "height": 60,
-  "weight": 30,
+  "weight": 35,
   "sex": "Male",
   "coat_type": "Short",
   "temperature_irgun": 38.5,
@@ -63,14 +66,37 @@ Example (Create collar with new session)
   "remarks": "Very active dog",
   "new_session": true
 }
+```
 
-Example (Update existing collar)
+Response:
+```json
+{
+  "ok": true,
+  "collar": { ...updated collar data... },
+  "session_id": "111",
+  "message": "Dog details updated and new session created with snapshot."
+}
+```
+
+Example (Update collar details WITHOUT creating session)
+```json
 {
   "collar_id": "C001",
   "dog_name": "Bruno",
-  "age": 4,
-  "weight": 32
+  "age": 6,
+  "weight": 37
 }
+```
+or
+```json
+{
+  "collar_id": "C001",
+  "dog_name": "Bruno",
+  "age": 6,
+  "weight": 37,
+  "new_session": false
+}
+```
 
 2. PUT /chunks
 
@@ -148,15 +174,31 @@ Example Response
 
 Session Logic
 
-Sessions are created when:
-- POST /collars includes "new_session": true
-- PUT /chunks includes "new_session": true
+**When `new_session: true` is sent:**
+1. Collar dog details are **updated** with new values
+2. A new session is created and marked as active
+3. Dog metadata (name, breed, age, weight, sex, etc.) is **captured and stored as a snapshot** in that session
+4. Previous session(s) are deactivated
+5. Complete historical record is maintained of dog state at each session
 
-Only one session can be active at a time per collar.
+**When `new_session: false` or omitted:**
+- Only collar details are updated
+- No new session is created
+- Existing active session continues unchanged
 
-Chunk uploads require an active session. If no active session exists, you must include "new_session": true.
+**Key Features:**
+- Only one session can be active at a time per collar
+- Chunk uploads require an active session
+- Query all sessions to see complete history of dog metadata changes over time
+- Each session has a unique session_id (e.g., "111", "222", or random hex)
+- Dog metadata snapshots allow tracking how dog profile evolved
 
-Each session gets a unique session_id (e.g., "111", "222", or a random hex string).
+**Example Timeline:**
+```
+Session 1 (age: 3) → 2 chunks uploaded
+Session 2 (age: 4) → 1 chunk uploaded  
+Session 3 (age: 5) → In progress
+```
 
 Temperature Processing
 
