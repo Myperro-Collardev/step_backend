@@ -342,10 +342,10 @@ async function upsertCollarCreateOnly(collarBody) {
   try {
     const res = await client.query(
       `INSERT INTO collars (
-         collar_id, dog_name, breed, coat_type, height, weight, sex,
+         collar_id, dog_name, breed, coat_type, height, weight, sex, age,
          temperature_irgun, collar_orientation, medical_info, remarks, created_at
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
        ON CONFLICT (collar_id) DO UPDATE
          SET dog_name = EXCLUDED.dog_name
        RETURNING *;`,
@@ -357,6 +357,7 @@ async function upsertCollarCreateOnly(collarBody) {
         collarBody.height || null,
         collarBody.weight || null,
         collarBody.sex || null,
+        collarBody.age || null,
         collarBody.temperature_irgun || null,
         collarBody.collar_orientation || null,
         collarBody.medical_info || null,
@@ -380,10 +381,11 @@ async function updateCollarFieldsWithSessionAuth(collarBody, session_id) {
          height=$5,
          weight=$6,
          sex=$7,
-         temperature_irgun=$8,
-         collar_orientation=$9,
-         medical_info=$10,
-         remarks=$11,
+         age=$8,
+         temperature_irgun=$9,
+         collar_orientation=$10,
+         medical_info=$11,
+         remarks=$12,
          updated_at=NOW()
        WHERE collar_id=$1
        RETURNING *;`,
@@ -395,6 +397,7 @@ async function updateCollarFieldsWithSessionAuth(collarBody, session_id) {
         collarBody.height || null,
         collarBody.weight || null,
         collarBody.sex || null,
+        collarBody.age || null,
         collarBody.temperature_irgun || null,
         collarBody.collar_orientation || null,
         collarBody.medical_info || null,
