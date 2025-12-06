@@ -346,22 +346,33 @@ async function upsertCollarCreateOnly(collarBody) {
          temperature_irgun, collar_orientation, medical_info, remarks, created_at
        )
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
-       ON CONFLICT (collar_id) DO UPDATE
-         SET dog_name = EXCLUDED.dog_name
+       ON CONFLICT (collar_id) DO UPDATE SET
+         dog_name = COALESCE(EXCLUDED.dog_name, collars.dog_name),
+         breed = COALESCE(EXCLUDED.breed, collars.breed),
+         coat_type = COALESCE(EXCLUDED.coat_type, collars.coat_type),
+         height = COALESCE(EXCLUDED.height, collars.height),
+         weight = COALESCE(EXCLUDED.weight, collars.weight),
+         sex = COALESCE(EXCLUDED.sex, collars.sex),
+         age = COALESCE(EXCLUDED.age, collars.age),
+         temperature_irgun = COALESCE(EXCLUDED.temperature_irgun, collars.temperature_irgun),
+         collar_orientation = COALESCE(EXCLUDED.collar_orientation, collars.collar_orientation),
+         medical_info = COALESCE(EXCLUDED.medical_info, collars.medical_info),
+         remarks = COALESCE(EXCLUDED.remarks, collars.remarks),
+         updated_at = NOW()
        RETURNING *;`,
       [
         collarBody.collar_id,
-        collarBody.dog_name || 'unknown',
-        collarBody.breed || null,
-        collarBody.coat_type || null,
-        collarBody.height || null,
-        collarBody.weight || null,
-        collarBody.sex || null,
-        collarBody.age || null,
-        collarBody.temperature_irgun || null,
-        collarBody.collar_orientation || null,
-        collarBody.medical_info || null,
-        collarBody.remarks || null
+        collarBody.dog_name ?? null,
+        collarBody.breed ?? null,
+        collarBody.coat_type ?? null,
+        collarBody.height ?? null,
+        collarBody.weight ?? null,
+        collarBody.sex ?? null,
+        collarBody.age ?? null,
+        collarBody.temperature_irgun ?? null,
+        collarBody.collar_orientation ?? null,
+        collarBody.medical_info ?? null,
+        collarBody.remarks ?? null
       ]
     );
     return res.rows[0];
