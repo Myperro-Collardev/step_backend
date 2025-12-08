@@ -46,140 +46,272 @@ app.use((req, res, next) => {
 app.use(bodyParser.json({ limit: '20mb' }));
 
 /* -----------------------------
-   StepCounter (same algorithm)
+   StepCounter (Sheep Algorithm - Jiang et al. 2023)
    ----------------------------- */
 class StepCounter {
-  constructor() {
-    this.SAMPLE_FPS = 100;
-    this.FC_GRAVITY = 0.10;
-    this.FC_DV = 0.20;
-    this.F_MIN = 2.25;
-    this.F_MAX = 3.75;
-    this.ZL_WINDOW_SEC = 20;
-    this.ZL_WINDOW_SAMPLES = this.ZL_WINDOW_SEC * this.SAMPLE_FPS;
-    this.PERIOD_WIN = 10;
-    this.PERIOD_MIN_INBAND = 7;
+  constructor(params = {}) {
+    // Sheep-specific algorithm parameters (from Jiang et al. 2023)
+    this.PEAK_THRESHOLD = params.peak_threshold || 12.0;
+    this.PEAK_WINDOW_N = params.peak_window_n || 4;
+    this.VALLEY_WINDOW_N = 2;
+    this.FILTER_WINDOW_SIZE = params.filter_window_size || 5;
+    this.PROCESS_WINDOW_SAMPLES = params.process_window_samples || 100;
+    this.RUN_START_THRESHOLD = params.run_start_threshold || 30.0;
+    this.SHAKE_START_THRESHOLD = params.shake_start_threshold || 12.0;
+    
+    // Running behavior thresholds
+    this.RUN_END_THRESHOLD_HIGH = 20.0;
+    this.RUN_END_THRESHOLD_LOW = 12.0;
+    this.RUN_PEAK_VALLEY_DIFF = 20.0;
+    this.RUN_SCALING_FACTOR = 2.1;
+    this.BASELINE_STEP_SAMPLES = 29;
+    
+    // Leg shaking thresholds
+    this.SHAKE_PEAK_VALLEY_DIFF = 12.0;
+    this.SHAKE_REGIONAL_PEAK_MAX = 39.0;
+    this.SHAKE_VARIANCE_THRESHOLD = 10.0;
 
-    this.g_est = { x: 0, y: 0, z: 1 };
-    this.dv_filt = 0;
-    this.dv_ring = new Array(this.ZL_WINDOW_SAMPLES).fill(0);
-    this.dv_head = 0;
-    this.dv_count = 0;
-    this.last_dv_minus_zero = 0;
-    this.last_candidate_ts = 0;
-    this.in_band_flags = new Array(this.PERIOD_WIN).fill(false);
-    this.in_band_idx = 0;
-    this.in_band_count = 0;
+    // Moving average filter for acceleration
+    this.filterBuffer = new Array(this.FILTER_WINDOW_SIZE).fill(0);
+    this.filterIndex = 0;
+    this.filterSum = 0;
+    this.filterCount = 0;
+
+    // Acceleration buffer for peak detection
+    this.accBuffer = [];
+    this.gyroBuffer = [];
+    
+    // Peak and valley storage
+    this.peaks = [];
+    this.valleys = [];
+    
+    // Step counting state
     this.step_count = 0;
-
-    this.a_grav = Math.exp(-2 * Math.PI * this.FC_GRAVITY / this.SAMPLE_FPS);
-    this.a_dv = Math.exp(-2 * Math.PI * this.FC_DV / this.SAMPLE_FPS);
+    this.running_steps = 0;
+    this.leg_shake_removed = 0;
+    this.sample_index = 0;
   }
 
-  normalize(v) {
-    const n = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (n < 1e-6) return { x: 0, y: 0, z: 1 };
-    return { x: v.x / n, y: v.y / n, z: v.z / n };
+  // Moving average filter
+  filterProcess(input) {
+    this.filterSum -= this.filterBuffer[this.filterIndex];
+    this.filterBuffer[this.filterIndex] = input;
+    this.filterSum += input;
+    this.filterIndex = (this.filterIndex + 1) % this.FILTER_WINDOW_SIZE;
+    if (this.filterCount < this.FILTER_WINDOW_SIZE) this.filterCount++;
+    return this.filterSum / this.filterCount;
   }
 
-  rotateFromTo(p, from, to) {
-    const f = this.normalize(from);
-    const t = this.normalize(to);
-    const dotRaw = f.x * t.x + f.y * t.y + f.z * t.z;
-    const dot = Math.max(-1, Math.min(1, dotRaw));
-    if (dot > 0.9999) return p;
-
-    let k = {
-      x: f.y * t.z - f.z * t.y,
-      y: f.z * t.x - f.x * t.z,
-      z: f.x * t.y - f.y * t.x
-    };
-    let kn = Math.sqrt(k.x * k.x + k.y * k.y + k.z * k.z);
-    if (kn < 1e-6) return p;
-    k.x /= kn;
-    k.y /= kn;
-    k.z /= kn;
-
-    const angle = Math.acos(dot);
-    const c = Math.cos(angle);
-    const s = Math.sin(angle);
-
-    const kxp = {
-      x: k.y * p.z - k.z * p.y,
-      y: k.z * p.x - k.x * p.z,
-      z: k.x * p.y - k.y * p.x
-    };
-    const kdp = k.x * p.x + k.y * p.y + k.z * p.z;
-
-    return {
-      x: p.x * c + kxp.x * s + k.x * kdp * (1 - c),
-      y: p.y * c + kxp.y * s + k.y * kdp * (1 - c),
-      z: p.z * c + kxp.z * s + k.z * kdp * (1 - c)
-    };
+  // Calculate combined acceleration (magnitude)
+  calculateCombinedAcceleration(ax, ay, az) {
+    return Math.sqrt(ax * ax + ay * ay + az * az);
   }
 
-  pushDV(v) {
-    this.dv_ring[this.dv_head] = v;
-    this.dv_head = (this.dv_head + 1) % this.ZL_WINDOW_SAMPLES;
-    if (this.dv_count < this.ZL_WINDOW_SAMPLES) this.dv_count++;
-  }
+  // Detect peaks using window method
+  detectPeaksAndValleys(filteredAcc, index) {
+    const centerIdx = this.accBuffer.length - 1;
+    const centerVal = filteredAcc;
 
-  zeroLine() {
-    if (this.dv_count === 0) return 0.0;
-    let vmin = this.dv_ring[0];
-    let vmax = this.dv_ring[0];
-    for (let i = 1; i < this.dv_count; ++i) {
-      const v = this.dv_ring[i];
-      if (v < vmin) vmin = v;
-      if (v > vmax) vmax = v;
+    // Need enough history for window
+    if (this.accBuffer.length < this.PEAK_WINDOW_N * 2 + 1) return;
+
+    // Check if this is a peak
+    let isPeak = centerVal > this.PEAK_THRESHOLD;
+    if (isPeak) {
+      // Check left and right windows
+      for (let i = 1; i <= this.PEAK_WINDOW_N; i++) {
+        const leftIdx = centerIdx - i;
+        if (leftIdx >= 0 && this.accBuffer[leftIdx] >= centerVal) {
+          isPeak = false;
+          break;
+        }
+      }
     }
-    return 0.5 * (vmax + vmin);
-  }
 
-  periodicityPush(inband) {
-    if (this.in_band_flags[this.in_band_idx]) this.in_band_count--;
-    this.in_band_flags[this.in_band_idx] = !!inband;
-    if (inband) this.in_band_count++;
-    this.in_band_idx = (this.in_band_idx + 1) % this.PERIOD_WIN;
-  }
+    if (isPeak) {
+      this.peaks.push({ value: centerVal, index: index });
+    }
 
-  processSample(sample) {
-    const now_ms = sample.ts;
-    const a_raw = { x: sample.ax, y: sample.ay, z: sample.az };
-
-    this.g_est.x = this.a_grav * this.g_est.x + (1 - this.a_grav) * a_raw.x;
-    this.g_est.y = this.a_grav * this.g_est.y + (1 - this.a_grav) * a_raw.y;
-    this.g_est.z = this.a_grav * this.g_est.z + (1 - this.a_grav) * a_raw.z;
-
-    const a_rot = this.rotateFromTo(a_raw, this.g_est, { x: 0, y: 0, z: 1 });
-    const dv = a_rot.z;
-
-    this.dv_filt = this.a_dv * this.dv_filt + (1 - this.a_dv) * dv;
-
-    this.pushDV(this.dv_filt);
-    const zline = this.zeroLine();
-
-    const dv_minus_zero = this.dv_filt - zline;
-    const falling_cross = this.last_dv_minus_zero > 0.0 && dv_minus_zero <= 0.0;
-    this.last_dv_minus_zero = dv_minus_zero;
-
-    if (falling_cross && this.dv_count >= 50) {
-      let inband = false;
-      if (this.last_candidate_ts !== 0) {
-        const dt_s = (now_ms - this.last_candidate_ts) / 1000.0;
-        const f_hz = dt_s > 1e-3 ? 1.0 / dt_s : 999.0;
-        inband = f_hz >= this.F_MIN && f_hz <= this.F_MAX;
+    // Check if this is a valley
+    let isValley = true;
+    for (let i = 1; i <= this.VALLEY_WINDOW_N; i++) {
+      const leftIdx = centerIdx - i;
+      const rightIdx = centerIdx + i;
+      if (leftIdx >= 0 && this.accBuffer[leftIdx] <= centerVal) {
+        isValley = false;
+        break;
       }
-      this.periodicityPush(inband);
-      if (inband && this.in_band_count >= this.PERIOD_MIN_INBAND) {
-        this.step_count++;
+      if (rightIdx < this.accBuffer.length && this.accBuffer[rightIdx] <= centerVal) {
+        isValley = false;
+        break;
       }
-      this.last_candidate_ts = now_ms;
+    }
+
+    if (isValley) {
+      this.valleys.push({ value: centerVal, index: index });
     }
   }
 
+  // Detect and count running behavior
+  detectAndCountRunning() {
+    let runStart = -1;
+    let runEnd = -1;
+
+    for (let i = 0; i < this.peaks.length; i++) {
+      if (this.peaks[i].value > this.RUN_START_THRESHOLD && runStart === -1) {
+        runStart = i;
+      }
+
+      if (runStart !== -1 && 
+          (this.peaks[i].value < this.RUN_END_THRESHOLD_HIGH || 
+           this.peaks[i].value < this.RUN_END_THRESHOLD_LOW)) {
+        runEnd = i;
+        break;
+      }
+    }
+
+    if (runStart !== -1 && runEnd !== -1) {
+      let isRunning = true;
+      for (let i = runStart; i < runEnd && i < this.valleys.length; i++) {
+        const peakValDiff = this.peaks[i].value - this.valleys[i].value;
+        if (peakValDiff >= this.peaks[i].value - this.RUN_PEAK_VALLEY_DIFF) {
+          isRunning = false;
+          break;
+        }
+      }
+
+      if (isRunning) {
+        const windowSize = this.peaks[runEnd].index - this.peaks[runStart].index;
+        const calculatedSteps = (windowSize * this.RUN_SCALING_FACTOR) / this.BASELINE_STEP_SAMPLES;
+        const runSteps = Math.round(calculatedSteps);
+        this.running_steps += runSteps;
+
+        // Mark these peaks as processed
+        for (let i = runStart; i <= runEnd; i++) {
+          this.peaks[i].value = 0;
+        }
+      }
+    }
+  }
+
+  // Detect and remove leg shaking
+  detectAndRemoveLegShaking() {
+    let shakeStart = -1;
+    let shakeEnd = -1;
+
+    for (let i = 0; i < this.peaks.length; i++) {
+      if (this.peaks[i].value === 0) continue;
+
+      if (this.peaks[i].value > this.SHAKE_START_THRESHOLD && shakeStart === -1) {
+        shakeStart = i;
+      }
+
+      if (shakeStart !== -1 && this.peaks[i].value < this.SHAKE_START_THRESHOLD) {
+        shakeEnd = i;
+
+        let isShaking = true;
+        for (let j = shakeStart; j < shakeEnd; j++) {
+          if (this.peaks[j].value > this.SHAKE_REGIONAL_PEAK_MAX) {
+            isShaking = false;
+            break;
+          }
+        }
+
+        if (isShaking) {
+          for (let j = shakeStart; j < shakeEnd && j < this.valleys.length; j++) {
+            const peakValDiff = this.peaks[j].value - this.valleys[j].value;
+            if (peakValDiff >= this.peaks[j].value - this.SHAKE_PEAK_VALLEY_DIFF) {
+              isShaking = false;
+              break;
+            }
+          }
+        }
+
+        // Check gyro variance
+        if (isShaking && this.gyroBuffer.length > 10) {
+          const variance = this.calculateVariance(this.gyroBuffer);
+          if (variance > this.SHAKE_VARIANCE_THRESHOLD) {
+            isShaking = false;
+          }
+        }
+
+        if (isShaking) {
+          const removedPeaks = shakeEnd - shakeStart;
+          this.leg_shake_removed += removedPeaks;
+
+          for (let j = shakeStart; j < shakeEnd; j++) {
+            this.peaks[j].value = 0;
+          }
+        }
+
+        shakeStart = -1;
+        shakeEnd = -1;
+      }
+    }
+  }
+
+  // Calculate variance
+  calculateVariance(buffer) {
+    if (buffer.length < 2) return 0;
+    const mean = buffer.reduce((a, b) => a + b, 0) / buffer.length;
+    const variance = buffer.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / buffer.length;
+    return variance;
+  }
+
+  // Count normal steps
+  countNormalSteps() {
+    let stepCount = 0;
+    for (let i = 0; i < this.peaks.length; i++) {
+      if (this.peaks[i].value > this.PEAK_THRESHOLD) {
+        stepCount++;
+      }
+    }
+    return stepCount;
+  }
+
+  // Process accumulated data
+  processAccumulatedData() {
+    if (this.peaks.length === 0) return;
+
+    this.detectAndCountRunning();
+    this.detectAndRemoveLegShaking();
+    const normalSteps = this.countNormalSteps();
+    
+    this.step_count += normalSteps;
+
+    // Clear buffers
+    this.peaks = [];
+    this.valleys = [];
+  }
+
+  // Process chunk of samples
   processChunk(samples) {
-    for (const s of samples) this.processSample(s);
+    for (const sample of samples) {
+      // Calculate combined acceleration
+      const combinedAcc = this.calculateCombinedAcceleration(sample.ax, sample.ay, sample.az);
+      
+      // Apply moving average filter
+      const filteredAcc = this.filterProcess(combinedAcc);
+      
+      // Store in buffer
+      this.accBuffer.push(filteredAcc);
+      this.gyroBuffer.push(sample.gx || 0);
+      
+      // Detect peaks and valleys
+      this.detectPeaksAndValleys(filteredAcc, this.sample_index);
+      
+      this.sample_index++;
+      
+      // Process when buffer reaches window size
+      if (this.accBuffer.length >= this.PROCESS_WINDOW_SAMPLES) {
+        this.processAccumulatedData();
+        
+        // Keep last PEAK_WINDOW_N samples for continuity
+        this.accBuffer = this.accBuffer.slice(-this.PEAK_WINDOW_N);
+        this.gyroBuffer = this.gyroBuffer.slice(-this.PEAK_WINDOW_N);
+      }
+    }
+    
     return this.step_count;
   }
 }
@@ -187,8 +319,49 @@ class StepCounter {
 /* -----------------------------
    In-memory maps for state (per-collar)
    ----------------------------- */
-const stepCounterByCollar = new Map();
+// Track steps per active session (keyed by `${collar_id}:${session_id}`)
+const stepCounterBySession = new Map();
 const mappingByCollar = new Map();
+
+// Buffer previous chunk's samples for each session
+const lastChunkSamplesBySession = new Map();
+
+// Sum all steps_in_chunk for a given collar+session from the DB
+async function getSessionStepTotal(collar_id, session_id) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM((output_metric->>'steps_in_chunk')::numeric), 0) AS total
+       FROM collar_chunks
+      WHERE collar_id = $1 AND session_id = $2`,
+    [collar_id, session_id]
+  );
+  return Number(rows[0].total || 0);
+}
+
+async function getStepCounterParams(collar_id, session_id) {
+  const { rows } = await pool.query(
+    `SELECT peak_threshold, peak_window_n, filter_window_size, 
+            process_window_samples, run_start_threshold, shake_start_threshold
+     FROM step_counter_params
+     WHERE collar_id = $1 AND session_id = $2
+     LIMIT 1`,
+    [collar_id, session_id]
+  );
+  return rows.length > 0 ? rows[0] : {};
+}
+
+async function getOrInitStepCounter(collar_id, session_id) {
+  const key = `${collar_id}:${session_id}`;
+  let sc = stepCounterBySession.get(key);
+  if (sc) return sc;
+
+  // Fetch params from DB for this session
+  const params = await getStepCounterParams(collar_id, session_id);
+  sc = new StepCounter(params);
+  // Seed from DB so restarts preserve counts
+  sc.step_count = await getSessionStepTotal(collar_id, session_id);
+  stepCounterBySession.set(key, sc);
+  return sc;
+}
 
 /* -----------------------------
    Sessions helpers (collar_sessions table)
@@ -475,15 +648,18 @@ async function insertChunkRow(collar_id, session_id, decoded, summary, outputMet
   }
 }
 
-async function updateCollarOutputMetric(collar_id, outputMetric) {
+async function updateCollarOutputMetric(collar_id, session_id, sessionMetric) {
   const client = await pool.connect();
   try {
     await client.query(
       `UPDATE collars
-         SET output_metric = COALESCE(output_metric, '{}'::jsonb) || $2::jsonb,
+         SET output_metric = jsonb_set(
+               jsonb_set(COALESCE(output_metric, '{}'::jsonb),
+                         ARRAY['sessions', $2], $3::jsonb, true),
+               ARRAY['last_session_id'], to_jsonb($2)),
              updated_at = NOW()
        WHERE collar_id = $1`,
-      [collar_id, JSON.stringify(outputMetric)]
+      [collar_id, session_id, JSON.stringify(sessionMetric)]
     );
   } finally {
     client.release();
@@ -647,6 +823,23 @@ app.get('/collars/:collar_id', async (req, res) => {
 
     const collar = collarRes.rows[0];
 
+    // If sessionId provided, ensure it exists for this collar
+    if (sessionId) {
+      const { rows: sessionRows } = await pool.query(
+        'SELECT 1 FROM collar_sessions WHERE collar_id = $1 AND session_id = $2 LIMIT 1',
+        [cid, sessionId]
+      );
+      if (sessionRows.length === 0) {
+        return res.status(404).json({ error: 'session not found for this collar' });
+      }
+    }
+
+    // Session-scoped steps (sum of steps_in_chunk for this session)
+    let session_steps = null;
+    if (sessionId) {
+      session_steps = await getSessionStepTotal(cid, sessionId);
+    }
+
     // Fetch temperature readings - optionally filtered by session_id
     let chunksRes;
     if (sessionId) {
@@ -691,10 +884,28 @@ app.get('/collars/:collar_id', async (req, res) => {
       });
     }
 
-    return res.json({
+    // Build response with optional session-scoped steps
+    const responsePayload = {
       ...collar,
       temperature_list
-    });
+    };
+
+    if (session_steps !== null) {
+      responsePayload.session_steps = session_steps;
+
+      // If stored per-session metrics exist, surface that session's block
+      const sessionsMetric = (collar.output_metric || {}).sessions || {};
+      const sessionBlock = sessionsMetric[sessionId] || {};
+
+      responsePayload.output_metric = {
+        ...collar.output_metric,
+        steps: session_steps,
+        session_id: sessionId,
+        session_block: sessionBlock
+      };
+    }
+
+    return res.json(responsePayload);
 
   } catch (err) {
     console.error("GET /collars/:collar_id error", err);
@@ -790,19 +1001,27 @@ app.put('/chunks', async (req, res) => {
       mappingByCollar.set(collar_id, mapping);
     }
 
-    let sc = stepCounterByCollar.get(collar_id);
-    if (!sc) {
-      sc = new StepCounter();
-      stepCounterByCollar.set(collar_id, sc);
+    // Per-session step counter (persists across restarts using DB seed)
+    const sc = await getOrInitStepCounter(collar_id, session_id);
 
-      if (collarRows[0].output_metric?.steps) {
-        sc.step_count = Number(collarRows[0].output_metric.steps);
+
+      // --- Step counting over two consecutive chunks ---
+      const sessionKey = `${collar_id}:${session_id}`;
+      let combinedSamples = [];
+      if (lastChunkSamplesBySession.has(sessionKey)) {
+        // Combine previous chunk's samples with current
+        const prevSamples = lastChunkSamplesBySession.get(sessionKey);
+        combinedSamples = prevSamples.concat(mapped);
+      } else {
+        // First chunk, just use current samples
+        combinedSamples = mapped;
       }
-    }
+      const before = sc.step_count;
+      sc.processChunk(combinedSamples);
+      const after = sc.step_count;
 
-    const before = sc.step_count;
-    sc.processChunk(mapped);
-    const after = sc.step_count;
+      // Update buffer: store only current chunk's samples for next time
+      lastChunkSamplesBySession.set(sessionKey, mapped);
 
     const outputMetric = {
       steps_in_chunk: after - before,
@@ -818,7 +1037,8 @@ app.put('/chunks', async (req, res) => {
       collar_id, session_id, decoded, {}, outputMetric
     );
 
-    await updateCollarOutputMetric(collar_id, {
+    // Persist latest session steps onto collar keyed by collar+session
+    await updateCollarOutputMetric(collar_id, session_id, {
       steps: sc.step_count,
       last_chunk_id: chunkRow.id,
       last_update: new Date().toISOString()
@@ -833,6 +1053,203 @@ app.put('/chunks', async (req, res) => {
 
   } catch (err) {
     console.error("PUT /chunks error", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* -----------------------------
+   Step Counter Params Routes
+   ----------------------------- */
+
+/**
+ * POST /step-counter-params
+ * Insert/update step counter parameters for a session (Sheep Algorithm - Jiang et al. 2023)
+ * Body: { collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
+ *         process_window_samples, run_start_threshold, shake_start_threshold }
+ */
+app.post('/step-counter-params', async (req, res) => {
+  try {
+    const {
+      collar_id, session_id,
+      peak_threshold = 12.0,
+      peak_window_n = 4,
+      filter_window_size = 5,
+      process_window_samples = 100,
+      run_start_threshold = 30.0,
+      shake_start_threshold = 12.0
+    } = req.body;
+
+    if (!collar_id || !session_id) {
+      return res.status(400).json({ error: 'collar_id and session_id required' });
+    }
+
+    // Validate session exists for this collar
+    const isValid = await validateCompositeSession(collar_id, session_id);
+    if (!isValid) {
+      return res.status(404).json({ error: 'Invalid collar_id/session_id combination' });
+    }
+
+    // Upsert: update if exists, else insert
+    const { rows } = await pool.query(
+      `INSERT INTO step_counter_params
+        (collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
+         process_window_samples, run_start_threshold, shake_start_threshold, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
+       ON CONFLICT (collar_id, session_id)
+       DO UPDATE SET
+         peak_threshold = EXCLUDED.peak_threshold,
+         peak_window_n = EXCLUDED.peak_window_n,
+         filter_window_size = EXCLUDED.filter_window_size,
+         process_window_samples = EXCLUDED.process_window_samples,
+         run_start_threshold = EXCLUDED.run_start_threshold,
+         shake_start_threshold = EXCLUDED.shake_start_threshold,
+         updated_at = NOW()
+       RETURNING *`,
+      [collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
+       process_window_samples, run_start_threshold, shake_start_threshold]
+    );
+
+    // Clear from cache so next chunk will reload fresh params
+    const key = `${collar_id}:${session_id}`;
+    stepCounterBySession.delete(key);
+
+    return res.json({ ok: true, params: rows[0] });
+  } catch (err) {
+    console.error('POST /step-counter-params error', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /step-counter-params/:collar_id
+ * Get step counter parameters for a session
+ * Query params: session_id (optional - uses active session if not provided)
+ */
+app.get('/step-counter-params/:collar_id', async (req, res) => {
+  try {
+    const { collar_id } = req.params;
+    let { session_id } = req.query;
+
+    if (!collar_id) {
+      return res.status(400).json({ error: 'collar_id required' });
+    }
+
+    // If no session_id provided, get active session
+    if (!session_id) {
+      session_id = await getActiveSessionForCollar(collar_id);
+      if (!session_id) {
+        return res.status(404).json({ error: 'No active session found for this collar' });
+      }
+    }
+
+    const { rows } = await pool.query(
+      `SELECT * FROM step_counter_params
+       WHERE collar_id = $1 AND session_id = $2
+       LIMIT 1`,
+      [collar_id, session_id]
+    );
+
+    if (rows.length === 0) {
+      // Return defaults if no record exists
+      return res.json({
+        ok: true,
+        params: {
+          collar_id,
+          session_id,
+          peak_threshold: 12.0,
+          peak_window_n: 4,
+          filter_window_size: 5,
+          process_window_samples: 100,
+          run_start_threshold: 30.0,
+          shake_start_threshold: 12.0,
+          status: 'defaults'
+        }
+      });
+    }
+
+    return res.json({ ok: true, params: rows[0], status: 'stored' });
+  } catch (err) {
+    console.error('GET /step-counter-params error', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* -----------------------------
+   Config History Routes
+   ----------------------------- */
+
+/**
+ * POST /config
+ * Insert new config record for a session
+ * Body: { collar_id, session_id, emissivity, ssid, password }
+ */
+app.post('/config', async (req, res) => {
+  try {
+    const { collar_id, session_id, emissivity, ssid, password, changed_by } = req.body;
+
+    if (!collar_id || !session_id) {
+      return res.status(400).json({ error: 'collar_id and session_id required' });
+    }
+
+    // Validate session exists for this collar
+    const isValid = await validateCompositeSession(collar_id, session_id);
+    if (!isValid) {
+      return res.status(404).json({ error: 'Invalid collar_id/session_id combination' });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO collar_config_history 
+       (collar_id, session_id, emissivity, ssid, password, changed_by, changed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       RETURNING *`,
+      [collar_id, session_id, emissivity || null, ssid || null, password || null, changed_by || 'api']
+    );
+
+    return res.json({ ok: true, config: rows[0] });
+  } catch (err) {
+    console.error('POST /config error', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /config/:collar_id
+ * Get latest config for active session (or specific session if session_id provided)
+ * Query params: session_id (optional)
+ */
+app.get('/config/:collar_id', async (req, res) => {
+  try {
+    const { collar_id } = req.params;
+    let { session_id } = req.query;
+
+    if (!collar_id) {
+      return res.status(400).json({ error: 'collar_id required' });
+    }
+
+    // If no session_id provided, get active session
+    if (!session_id) {
+      session_id = await getActiveSessionForCollar(collar_id);
+      if (!session_id) {
+        return res.status(404).json({ error: 'No active session found for this collar' });
+      }
+    }
+
+    // Get latest config for the session
+    const { rows } = await pool.query(
+      `SELECT * FROM collar_config_history
+       WHERE collar_id = $1 AND session_id = $2
+       ORDER BY changed_at DESC
+       LIMIT 1`,
+      [collar_id, session_id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'No config found for this session' });
+    }
+
+    return res.json({ ok: true, config: rows[0], session_id });
+  } catch (err) {
+    console.error('GET /config/:collar_id error', err);
     return res.status(500).json({ error: err.message });
   }
 });
