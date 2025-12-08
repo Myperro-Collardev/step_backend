@@ -1168,28 +1168,11 @@ app.get('/sessions/:collar_id/:session_id', async (req, res) => {
 /**
  * POST /step-counter-params
  * Insert/update step counter parameters for a session (Sheep Algorithm - Jiang et al. 2023)
+ * Only updates fields that are provided in the request body
  */
 app.post('/step-counter-params', async (req, res) => {
   try {
-    const {
-      collar_id, session_id,
-      peak_threshold = 12.0,
-      peak_window_n = 4,
-      filter_window_size = 5,
-      process_window_samples = 100,
-      run_start_threshold = 30.0,
-      shake_start_threshold = 12.0,
-      sample_rate_hz = 32,
-      valley_window_n = 2,
-      run_end_threshold_high = 20.0,
-      run_end_threshold_low = 12.0,
-      run_peak_valley_diff = 20.0,
-      run_scaling_factor = 2.1,
-      baseline_step_samples = 29,
-      shake_peak_valley_diff = 12.0,
-      shake_regional_peak_max = 39.0,
-      shake_variance_threshold = 10.0
-    } = req.body;
+    const { collar_id, session_id, ...params } = req.body;
 
     if (!collar_id || !session_id) {
       return res.status(400).json({ error: 'collar_id and session_id required' });
@@ -1201,48 +1184,90 @@ app.post('/step-counter-params', async (req, res) => {
       return res.status(404).json({ error: 'Invalid collar_id/session_id combination' });
     }
 
-    // Upsert: update if exists, else insert
-    const { rows } = await pool.query(
-      `INSERT INTO step_counter_params
-        (collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
-         process_window_samples, run_start_threshold, shake_start_threshold,
-         sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
-         run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
-         shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold,
-         created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW())
-       ON CONFLICT (collar_id, session_id)
-       DO UPDATE SET
-         peak_threshold = EXCLUDED.peak_threshold,
-         peak_window_n = EXCLUDED.peak_window_n,
-         filter_window_size = EXCLUDED.filter_window_size,
-         process_window_samples = EXCLUDED.process_window_samples,
-         run_start_threshold = EXCLUDED.run_start_threshold,
-         shake_start_threshold = EXCLUDED.shake_start_threshold,
-         sample_rate_hz = EXCLUDED.sample_rate_hz,
-         valley_window_n = EXCLUDED.valley_window_n,
-         run_end_threshold_high = EXCLUDED.run_end_threshold_high,
-         run_end_threshold_low = EXCLUDED.run_end_threshold_low,
-         run_peak_valley_diff = EXCLUDED.run_peak_valley_diff,
-         run_scaling_factor = EXCLUDED.run_scaling_factor,
-         baseline_step_samples = EXCLUDED.baseline_step_samples,
-         shake_peak_valley_diff = EXCLUDED.shake_peak_valley_diff,
-         shake_regional_peak_max = EXCLUDED.shake_regional_peak_max,
-         shake_variance_threshold = EXCLUDED.shake_variance_threshold,
-         updated_at = NOW()
-       RETURNING *`,
-      [collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
-       process_window_samples, run_start_threshold, shake_start_threshold,
-       sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
-       run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
-       shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold]
+    // Default values for initial insert
+    const defaults = {
+      peak_threshold: 12.0,
+      peak_window_n: 4,
+      filter_window_size: 5,
+      process_window_samples: 100,
+      run_start_threshold: 30.0,
+      shake_start_threshold: 12.0,
+      sample_rate_hz: 32,
+      valley_window_n: 2,
+      run_end_threshold_high: 20.0,
+      run_end_threshold_low: 12.0,
+      run_peak_valley_diff: 20.0,
+      run_scaling_factor: 2.1,
+      baseline_step_samples: 29,
+      shake_peak_valley_diff: 12.0,
+      shake_regional_peak_max: 39.0,
+      shake_variance_threshold: 10.0
+    };
+
+    // Check if record exists
+    const { rows: existing } = await pool.query(
+      `SELECT * FROM step_counter_params WHERE collar_id = $1 AND session_id = $2`,
+      [collar_id, session_id]
     );
+
+    let result;
+    if (existing.length === 0) {
+      // Insert with defaults + provided params
+      const insertParams = { ...defaults, ...params };
+      const { rows } = await pool.query(
+        `INSERT INTO step_counter_params
+          (collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
+           process_window_samples, run_start_threshold, shake_start_threshold,
+           sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
+           run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
+           shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold,
+           created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW())
+         RETURNING *`,
+        [collar_id, session_id, 
+         insertParams.peak_threshold, insertParams.peak_window_n, insertParams.filter_window_size,
+         insertParams.process_window_samples, insertParams.run_start_threshold, insertParams.shake_start_threshold,
+         insertParams.sample_rate_hz, insertParams.valley_window_n, insertParams.run_end_threshold_high, 
+         insertParams.run_end_threshold_low, insertParams.run_peak_valley_diff, insertParams.run_scaling_factor,
+         insertParams.baseline_step_samples, insertParams.shake_peak_valley_diff, insertParams.shake_regional_peak_max,
+         insertParams.shake_variance_threshold]
+      );
+      result = rows[0];
+    } else {
+      // Update only provided fields
+      const updateFields = [];
+      const updateValues = [collar_id, session_id];
+      let paramIndex = 3;
+
+      for (const [key, value] of Object.entries(params)) {
+        if (defaults.hasOwnProperty(key)) {
+          updateFields.push(`${key} = $${paramIndex}`);
+          updateValues.push(value);
+          paramIndex++;
+        }
+      }
+
+      if (updateFields.length === 0) {
+        return res.status(400).json({ error: 'No valid parameters to update' });
+      }
+
+      updateFields.push('updated_at = NOW()');
+
+      const { rows } = await pool.query(
+        `UPDATE step_counter_params 
+         SET ${updateFields.join(', ')}
+         WHERE collar_id = $1 AND session_id = $2
+         RETURNING *`,
+        updateValues
+      );
+      result = rows[0];
+    }
 
     // Clear from cache so next chunk will reload fresh params
     const key = `${collar_id}:${session_id}`;
     stepCounterBySession.delete(key);
 
-    return res.json({ ok: true, params: rows[0] });
+    return res.json({ ok: true, params: result });
   } catch (err) {
     console.error('POST /step-counter-params error', err);
     return res.status(500).json({ error: err.message });
