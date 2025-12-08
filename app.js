@@ -1,18 +1,25 @@
 /**
- * app.js - fixed version
+ * app.js - fixed version with memory leak and step counting fixes
  * Express + Postgres service for collars with composite sessions
  *
  * Endpoints:
- *  POST /collars    -> create collar (optional session:true), or update (requires collar_id+session_id)
+ *  POST /collars    -> create collar (optional new_session:true), or update (requires collar_id+session_id)
  *  GET  /collars
  *  GET  /collars/:id
- *  GET  /dog/:id
- *  POST /chunks     -> ingest chunk (client sends collar_id + chunk_json only)
- *  GET  /metrics/:id
+ *  PUT  /chunks     -> ingest chunk (client sends collar_id + chunk_json only)
+ *  GET  /sessions/:collar_id
+ *  GET  /sessions/:collar_id/:session_id
+ *  POST /step-counter-params
+ *  GET  /step-counter-params/:collar_id
+ *  POST /config
+ *  GET  /config/:collar_id
+ *  GET  /health
+ *  POST /admin/cleanup-sessions
  *
  * Notes:
  *  - chunk_json must include imu_data (base64)
- *  - POST /collars with { session: true } will create+activate a new session and return it
+ *  - POST /collars with { new_session: true } will create+activate a new session and return it
+ *  - Memory cleanup runs every 30 minutes (clears inactive session caches, DB records preserved)
  */
 require('dotenv').config();
 
@@ -22,10 +29,16 @@ const { Pool } = require('pg');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
-const DATABASE_URL = process.env.DATABASE_URL;
 
-
-const pool = new Pool({ connectionString: DATABASE_URL });
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  // Enable SSL for AWS Aurora
+  ssl: { rejectUnauthorized: false },
+});
 
 const app = express();
 
@@ -51,25 +64,28 @@ app.use(bodyParser.json({ limit: '20mb' }));
 class StepCounter {
   constructor(params = {}) {
     // Sheep-specific algorithm parameters (from Jiang et al. 2023)
+    this.SAMPLE_RATE_HZ = params.sample_rate_hz || 32;
+    this.SAMPLE_PERIOD_MS = 1000 / this.SAMPLE_RATE_HZ;
+    
     this.PEAK_THRESHOLD = params.peak_threshold || 12.0;
     this.PEAK_WINDOW_N = params.peak_window_n || 4;
-    this.VALLEY_WINDOW_N = 2;
+    this.VALLEY_WINDOW_N = params.valley_window_n || 2;
     this.FILTER_WINDOW_SIZE = params.filter_window_size || 5;
     this.PROCESS_WINDOW_SAMPLES = params.process_window_samples || 100;
-    this.RUN_START_THRESHOLD = params.run_start_threshold || 30.0;
-    this.SHAKE_START_THRESHOLD = params.shake_start_threshold || 12.0;
     
     // Running behavior thresholds
-    this.RUN_END_THRESHOLD_HIGH = 20.0;
-    this.RUN_END_THRESHOLD_LOW = 12.0;
-    this.RUN_PEAK_VALLEY_DIFF = 20.0;
-    this.RUN_SCALING_FACTOR = 2.1;
-    this.BASELINE_STEP_SAMPLES = 29;
+    this.RUN_START_THRESHOLD = params.run_start_threshold || 30.0;
+    this.RUN_END_THRESHOLD_HIGH = params.run_end_threshold_high || 20.0;
+    this.RUN_END_THRESHOLD_LOW = params.run_end_threshold_low || 12.0;
+    this.RUN_PEAK_VALLEY_DIFF = params.run_peak_valley_diff || 20.0;
+    this.RUN_SCALING_FACTOR = params.run_scaling_factor || 2.1;
+    this.BASELINE_STEP_SAMPLES = params.baseline_step_samples || 29;
     
     // Leg shaking thresholds
-    this.SHAKE_PEAK_VALLEY_DIFF = 12.0;
-    this.SHAKE_REGIONAL_PEAK_MAX = 39.0;
-    this.SHAKE_VARIANCE_THRESHOLD = 10.0;
+    this.SHAKE_START_THRESHOLD = params.shake_start_threshold || 12.0;
+    this.SHAKE_PEAK_VALLEY_DIFF = params.shake_peak_valley_diff || 12.0;
+    this.SHAKE_REGIONAL_PEAK_MAX = params.shake_regional_peak_max || 39.0;
+    this.SHAKE_VARIANCE_THRESHOLD = params.shake_variance_threshold || 10.0;
 
     // Moving average filter for acceleration
     this.filterBuffer = new Array(this.FILTER_WINDOW_SIZE).fill(0);
@@ -109,46 +125,57 @@ class StepCounter {
 
   // Detect peaks using window method
   detectPeaksAndValleys(filteredAcc, index) {
-    const centerIdx = this.accBuffer.length - 1;
-    const centerVal = filteredAcc;
+    const n = this.accBuffer.length;
+    
+    // Need enough history for window (check center point at n - PEAK_WINDOW_N - 1)
+    if (n < this.PEAK_WINDOW_N * 2 + 1) return;
 
-    // Need enough history for window
-    if (this.accBuffer.length < this.PEAK_WINDOW_N * 2 + 1) return;
+    const centerIdx = n - this.PEAK_WINDOW_N - 1;
+    if (centerIdx < this.PEAK_WINDOW_N) return;
+    
+    const centerVal = this.accBuffer[centerIdx];
 
-    // Check if this is a peak
+    // Peak detection: center must be maximum in window
     let isPeak = centerVal > this.PEAK_THRESHOLD;
     if (isPeak) {
-      // Check left and right windows
-      for (let i = 1; i <= this.PEAK_WINDOW_N; i++) {
-        const leftIdx = centerIdx - i;
-        if (leftIdx >= 0 && this.accBuffer[leftIdx] >= centerVal) {
-          isPeak = false;
-          break;
+      for (let i = -this.PEAK_WINDOW_N; i <= this.PEAK_WINDOW_N; i++) {
+        if (i === 0) continue;
+        const idx = centerIdx + i;
+        if (idx >= 0 && idx < n) {
+          if (this.accBuffer[idx] >= centerVal) {
+            isPeak = false;
+            break;
+          }
         }
       }
     }
 
     if (isPeak) {
-      this.peaks.push({ value: centerVal, index: index });
+      this.peaks.push({ 
+        value: centerVal, 
+        index: this.sample_index - (n - centerIdx),
+        processed: false 
+      });
     }
 
-    // Check if this is a valley
+    // Valley detection: center must be minimum in window
     let isValley = true;
-    for (let i = 1; i <= this.VALLEY_WINDOW_N; i++) {
-      const leftIdx = centerIdx - i;
-      const rightIdx = centerIdx + i;
-      if (leftIdx >= 0 && this.accBuffer[leftIdx] <= centerVal) {
-        isValley = false;
-        break;
-      }
-      if (rightIdx < this.accBuffer.length && this.accBuffer[rightIdx] <= centerVal) {
-        isValley = false;
-        break;
+    for (let i = -this.VALLEY_WINDOW_N; i <= this.VALLEY_WINDOW_N; i++) {
+      if (i === 0) continue;
+      const idx = centerIdx + i;
+      if (idx >= 0 && idx < n) {
+        if (this.accBuffer[idx] <= centerVal) {
+          isValley = false;
+          break;
+        }
       }
     }
 
     if (isValley) {
-      this.valleys.push({ value: centerVal, index: index });
+      this.valleys.push({ 
+        value: centerVal, 
+        index: this.sample_index - (n - centerIdx) 
+      });
     }
   }
 
@@ -158,6 +185,8 @@ class StepCounter {
     let runEnd = -1;
 
     for (let i = 0; i < this.peaks.length; i++) {
+      if (this.peaks[i].processed) continue;
+      
       if (this.peaks[i].value > this.RUN_START_THRESHOLD && runStart === -1) {
         runStart = i;
       }
@@ -170,13 +199,15 @@ class StepCounter {
       }
     }
 
-    if (runStart !== -1 && runEnd !== -1) {
+    if (runStart !== -1 && runEnd !== -1 && runEnd > runStart) {
       let isRunning = true;
-      for (let i = runStart; i < runEnd && i < this.valleys.length; i++) {
-        const peakValDiff = this.peaks[i].value - this.valleys[i].value;
-        if (peakValDiff >= this.peaks[i].value - this.RUN_PEAK_VALLEY_DIFF) {
-          isRunning = false;
-          break;
+      for (let i = runStart; i < Math.min(runEnd, this.valleys.length); i++) {
+        if (i < this.peaks.length && i < this.valleys.length) {
+          const peakValDiff = this.peaks[i].value - this.valleys[i].value;
+          if (peakValDiff >= this.peaks[i].value - this.RUN_PEAK_VALLEY_DIFF) {
+            isRunning = false;
+            break;
+          }
         }
       }
 
@@ -188,7 +219,9 @@ class StepCounter {
 
         // Mark these peaks as processed
         for (let i = runStart; i <= runEnd; i++) {
-          this.peaks[i].value = 0;
+          if (i < this.peaks.length) {
+            this.peaks[i].processed = true;
+          }
         }
       }
     }
@@ -302,8 +335,9 @@ class StepCounter {
       
       this.sample_index++;
       
-      // Process when buffer reaches window size
-      if (this.accBuffer.length >= this.PROCESS_WINDOW_SAMPLES) {
+      // Process every second (SAMPLE_RATE_HZ samples) or when buffer reaches max
+      if (this.accBuffer.length >= this.SAMPLE_RATE_HZ || 
+          this.accBuffer.length >= this.PROCESS_WINDOW_SAMPLES) {
         this.processAccumulatedData();
         
         // Keep last PEAK_WINDOW_N samples for continuity
@@ -318,13 +352,84 @@ class StepCounter {
 
 /* -----------------------------
    In-memory maps for state (per-collar)
+   ✅ FIXED: Memory leak prevention with cleanup
    ----------------------------- */
-// Track steps per active session (keyed by `${collar_id}:${session_id}`)
+// Track steps per active session (keyed by ${collar_id}:${session_id})
 const stepCounterBySession = new Map();
 const mappingByCollar = new Map();
 
-// Buffer previous chunk's samples for each session
-const lastChunkSamplesBySession = new Map();
+// ✅ Track timestamp for memory cleanup (NOT for deleting DB records)
+const sessionLastAccessTime = new Map();
+const SESSION_CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const SESSION_INACTIVE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
+
+// ✅ Track last sample number instead of buffering entire sample arrays
+const lastSampleNumberBySession = new Map();
+
+// ✅ Cleanup IN-MEMORY caches only - DB records stay forever
+function cleanupInactiveSessions() {
+  const now = Date.now();
+  const keysToDelete = [];
+
+  for (const [key, lastAccess] of sessionLastAccessTime.entries()) {
+    if (now - lastAccess > SESSION_INACTIVE_THRESHOLD_MS) {
+      keysToDelete.push(key);
+    }
+  }
+
+  for (const key of keysToDelete) {
+    // Only clear memory caches - DB records remain intact
+    stepCounterBySession.delete(key);
+    lastSampleNumberBySession.delete(key);
+    sessionLastAccessTime.delete(key);
+    console.log(`[Memory Cleanup] Cleared in-memory cache for inactive session: ${key} (DB records preserved)`);
+  }
+
+  if (keysToDelete.length > 0) {
+    console.log(`[Memory Cleanup] Freed memory for ${keysToDelete.length} inactive sessions. All DB data preserved.`);
+  }
+}
+
+// Start cleanup interval
+setInterval(cleanupInactiveSessions, SESSION_CLEANUP_INTERVAL_MS);
+
+/* -----------------------------
+   Helper to update session access time
+   ----------------------------- */
+function touchSession(collar_id, session_id) {
+  const key = `${collar_id}:${session_id}`;
+  sessionLastAccessTime.set(key, Date.now());
+}
+
+/* -----------------------------
+   ✅ Enhanced: Load last processed sample from DB if not in memory
+   ----------------------------- */
+async function getLastProcessedSampleNumber(collar_id, session_id) {
+  const sessionKey =  `${collar_id}:${session_id}`;
+  
+  // Check memory first
+  if (lastSampleNumberBySession.has(sessionKey)) {
+    return lastSampleNumberBySession.get(sessionKey);
+  }
+  
+  // If not in memory, load from DB (happens after memory cleanup or restart)
+  const { rows } = await pool.query(
+    `SELECT MAX((output_metric->>'last_sample_number')::bigint) as last_sample
+     FROM collar_chunks
+     WHERE collar_id = $1 AND session_id = $2`,
+    [collar_id, session_id]
+  );
+  
+  const lastSample = rows[0]?.last_sample || null;
+  
+  if (lastSample !== null) {
+    // Cache it back in memory
+    lastSampleNumberBySession.set(sessionKey, lastSample);
+    console.log(`[DB Recovery] Loaded last_sample_number=${lastSample} for session ${sessionKey} from DB`);
+  }
+  
+  return lastSample;
+}
 
 // Sum all steps_in_chunk for a given collar+session from the DB
 async function getSessionStepTotal(collar_id, session_id) {
@@ -340,7 +445,10 @@ async function getSessionStepTotal(collar_id, session_id) {
 async function getStepCounterParams(collar_id, session_id) {
   const { rows } = await pool.query(
     `SELECT peak_threshold, peak_window_n, filter_window_size, 
-            process_window_samples, run_start_threshold, shake_start_threshold
+            process_window_samples, run_start_threshold, shake_start_threshold,
+            sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
+            run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
+            shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold
      FROM step_counter_params
      WHERE collar_id = $1 AND session_id = $2
      LIMIT 1`,
@@ -569,46 +677,6 @@ async function upsertCollarCreateOnly(collarBody) {
   }
 }
 
-async function updateCollarFieldsWithSessionAuth(collarBody, session_id) {
-  const client = await pool.connect();
-  try {
-    const res = await client.query(
-      `UPDATE collars SET
-         dog_name=$2,
-         breed=$3,
-         coat_type=$4,
-         height=$5,
-         weight=$6,
-         sex=$7,
-         age=$8,
-         temperature_irgun=$9,
-         collar_orientation=$10,
-         medical_info=$11,
-         remarks=$12,
-         updated_at=NOW()
-       WHERE collar_id=$1
-       RETURNING *;`,
-      [
-        collarBody.collar_id,
-        collarBody.dog_name || null,
-        collarBody.breed || null,
-        collarBody.coat_type || null,
-        collarBody.height || null,
-        collarBody.weight || null,
-        collarBody.sex || null,
-        collarBody.age || null,
-        collarBody.temperature_irgun || null,
-        collarBody.collar_orientation || null,
-        collarBody.medical_info || null,
-        collarBody.remarks || null
-      ]
-    );
-    return res.rows[0];
-  } finally {
-    client.release();
-  }
-}
-
 async function insertChunkRow(collar_id, session_id, decoded, summary, outputMetric) {
   const client = await pool.connect();
   try {
@@ -672,41 +740,8 @@ async function updateCollarOutputMetric(collar_id, session_id, sessionMetric) {
 
 /**
  * POST /collars
- * Create collar if missing. If body.session === true, create & activate session and return session_id.
- * For updates: client must include session_id and it must be valid for this collar (composite).
+ * Create collar if missing. If body.new_session === true, create & activate session and return session_id.
  */
-// app.post('/collars', async (req, res) => {
-//   try {
-//     const body = req.body;
-//     if (!body || !body.collar_id) {
-//       return res.status(400).json({ error: 'collar_id required' });
-//     }
-
-//     // If caller provided session_id -> treat as authenticated update
-//     if (body.session_id) {
-//       const ok = await validateCompositeSession(body.collar_id, body.session_id);
-//       if (!ok) {
-//         return res.status(401).json({ error: 'invalid collar_id/session_id' });
-//       }
-//       const updated = await updateCollarFieldsWithSessionAuth(body, body.session_id);
-//       return res.json({ ok: true, collar: updated });
-//     }
-
-//     // Else: create collar if missing
-//     const collar = await upsertCollarCreateOnly(body);
-
-//     // If caller explicitly asks for a session to be created and activated now
-//     if (body.session === true) {
-//       const session_id = await generateAndInsertSession(collar.collar_id, 'api_create');
-//       return res.json({ ok: true, collar, session_id });
-//     }
-
-//     return res.json({ ok: true, collar });
-//   } catch (err) {
-//     console.error('POST /collars error', err);
-//     return res.status(500).json({ error: err.message });
-//   }
-// });
 app.post('/collars', async (req, res) => {
   try {
     const body = req.body;
@@ -754,7 +789,6 @@ app.post('/collars', async (req, res) => {
   }
 });
 
-
 // GET /collars
 app.get('/collars', async (req, res) => {
   try {
@@ -769,43 +803,6 @@ app.get('/collars', async (req, res) => {
 });
 
 // GET /collars/:collar_id
-// app.get('/collars/:collar_id', async (req, res) => {
-//   try {
-//     const cid = req.params.collar_id;
-//     const { rows } = await pool.query(
-//       'SELECT * FROM collars WHERE collar_id = $1',
-//       [cid]
-//     );
-//     if (rows.length === 0) {
-//       return res.status(404).json({ error: 'not found' });
-//     }
-//     return res.json(rows[0]);
-//   } catch (err) {
-//     console.error('GET /collars/:collar_id error', err);
-//     return res.status(500).json({ error: err.message });
-//   }
-// });
-
-// // GET /dog/:collar_id
-// app.get('/dog/:collar_id', async (req, res) => {
-//   try {
-//     const cid = req.params.collar_id;
-//     const { rows } = await pool.query(
-//       `SELECT collar_id, dog_name, breed, coat_type,
-//               height, weight, sex, medical_info, remarks
-//        FROM collars WHERE collar_id = $1`,
-//       [cid]
-//     );
-//     if (rows.length === 0) {
-//       return res.status(404).json({ error: 'not found' });
-//     }
-//     return res.json(rows[0]);
-//   } catch (err) {
-//     console.error('GET /dog/:collar_id error', err);
-//     return res.status(500).json({ error: err.message });
-//   }
-// });
-
 app.get('/collars/:collar_id', async (req, res) => {
   try {
     const cid = req.params.collar_id;
@@ -915,19 +912,7 @@ app.get('/collars/:collar_id', async (req, res) => {
 
 /**
  * PUT /chunks
- * New firmware format:
- * {
- *   "data": {
- *     "chunk_00000000": {
- *        "collar_id": "C001",
- *        "imu_data": "...",
- *        "temp_data": [...],
- *        "temp_first_timestamp": "...",
- *        "real_time": "...",
- *        "start_sample": 0
- *     }
- *   }
- * }
+ * ✅ FIXED: Prevents double-counting and memory leaks
  */
 app.put('/chunks', async (req, res) => {
   try {
@@ -977,6 +962,13 @@ app.put('/chunks', async (req, res) => {
         remarks: collarRows[0].remarks
       };
       session_id = await generateAndInsertSession(collar_id, "manual", dogMetadata);
+      
+      // ✅ Clear old session MEMORY cache (DB records stay)
+      const oldKey = `${collar_id}:${session_id}`;
+      stepCounterBySession.delete(oldKey);
+      lastSampleNumberBySession.delete(oldKey);
+      sessionLastAccessTime.delete(oldKey);
+      console.log(`[New Session] Cleared memory cache for ${oldKey}, DB records preserved`);
     }
 
     // ❌ Do NOT create session automatically
@@ -985,6 +977,9 @@ app.put('/chunks', async (req, res) => {
         error: "No active session. Call PUT /chunks with {new_session: true} to start a new session."
       });
     }
+
+    // ✅ Update session access time
+    touchSession(collar_id, session_id);
 
     // -----------------------
     // Decode + Process IMU
@@ -1004,28 +999,51 @@ app.put('/chunks', async (req, res) => {
     // Per-session step counter (persists across restarts using DB seed)
     const sc = await getOrInitStepCounter(collar_id, session_id);
 
+    // ✅ CORRECTED step counting logic - only process NEW samples
+    const sessionKey = `${collar_id}:${session_id}`;
+    
+    // ✅ Load last processed sample (from memory or DB)
+    const lastProcessedSampleNumber = await getLastProcessedSampleNumber(collar_id, session_id);
+    
+    // Filter out samples we've already processed
+    let samplesToProcess = mapped;
+    
+    if (lastProcessedSampleNumber !== null) {
+      // Only process samples with sample_number > last processed
+      samplesToProcess = mapped.filter(s => s.sample_number > lastProcessedSampleNumber);
+      
+      console.log(`Session ${sessionKey}: Last processed sample=${lastProcessedSampleNumber}, ` +
+                  `Current chunk has ${mapped.length} samples, ` +
+                  `Processing ${samplesToProcess.length} new samples`);
+    } else {
+      console.log(`Session ${sessionKey}: First chunk, processing all ${samplesToProcess.length} samples`);
+    }
 
-      // --- Step counting over two consecutive chunks ---
-      const sessionKey = `${collar_id}:${session_id}`;
-      let combinedSamples = [];
-      if (lastChunkSamplesBySession.has(sessionKey)) {
-        // Combine previous chunk's samples with current
-        const prevSamples = lastChunkSamplesBySession.get(sessionKey);
-        combinedSamples = prevSamples.concat(mapped);
-      } else {
-        // First chunk, just use current samples
-        combinedSamples = mapped;
-      }
+    // Only process if we have new samples
+    let stepsInChunk = 0;
+    let lastSampleNumber = lastProcessedSampleNumber;
+    
+    if (samplesToProcess.length > 0) {
       const before = sc.step_count;
-      sc.processChunk(combinedSamples);
+      sc.processChunk(samplesToProcess);
       const after = sc.step_count;
+      stepsInChunk = after - before;
 
-      // Update buffer: store only current chunk's samples for next time
-      lastChunkSamplesBySession.set(sessionKey, mapped);
+      // ✅ Update the last processed sample number (in memory AND will save to DB)
+      const lastSampleInChunk = mapped[mapped.length - 1];
+      lastSampleNumber = lastSampleInChunk.sample_number;
+      lastSampleNumberBySession.set(sessionKey, lastSampleNumber);
+    } else {
+      console.warn(`Session ${sessionKey}: No new samples to process (possible duplicate chunk)`);
+    }
 
+    // ✅ Enhanced output metric - includes last_sample_number for DB persistence
     const outputMetric = {
-      steps_in_chunk: after - before,
+      steps_in_chunk: stepsInChunk,
       cumulative_steps: sc.step_count,
+      samples_processed: samplesToProcess.length,
+      total_samples_in_chunk: mapped.length,
+      last_sample_number: lastSampleNumber, // ✅ Store in DB for recovery
       temp_avg_c: decoded.temp_data?.length
         ? decoded.temp_data.reduce((a, b) => a + b, 0) / decoded.temp_data.length
         : null,
@@ -1041,6 +1059,7 @@ app.put('/chunks', async (req, res) => {
     await updateCollarOutputMetric(collar_id, session_id, {
       steps: sc.step_count,
       last_chunk_id: chunkRow.id,
+      last_sample_number: lastSampleNumber, // ✅ Also store here
       last_update: new Date().toISOString()
     });
 
@@ -1058,14 +1077,97 @@ app.put('/chunks', async (req, res) => {
 });
 
 /* -----------------------------
+   ✅ NEW: Session Management Endpoints
+   ----------------------------- */
+
+/**
+ * GET /sessions/:collar_id
+ * List all sessions for a collar (active + inactive)
+ */
+app.get('/sessions/:collar_id', async (req, res) => {
+  try {
+    const { collar_id } = req.params;
+
+    const { rows } = await pool.query(
+      `SELECT 
+        cs.session_id,
+        cs.active,
+        cs.created_by,
+        cs.dog_metadata,
+        cs.created_at,
+        COUNT(cc.id) as chunk_count,
+        COALESCE(SUM((cc.output_metric->>'steps_in_chunk')::numeric), 0) as total_steps,
+        MAX(cc.created_at) as last_chunk_at
+       FROM collar_sessions cs
+       LEFT JOIN collar_chunks cc ON cs.collar_id = cc.collar_id AND cs.session_id = cc.session_id
+       WHERE cs.collar_id = $1
+       GROUP BY cs.session_id, cs.active, cs.created_by, cs.dog_metadata, cs.created_at
+       ORDER BY cs.created_at DESC`,
+      [collar_id]
+    );
+
+    return res.json({
+      ok: true,
+      collar_id,
+      sessions: rows,
+      total_sessions: rows.length
+    });
+  } catch (err) {
+    console.error('GET /sessions/:collar_id error', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /sessions/:collar_id/:session_id
+ * Get detailed session data
+ */
+app.get('/sessions/:collar_id/:session_id', async (req, res) => {
+  try {
+    const { collar_id, session_id } = req.params;
+
+    // Get session info
+    const { rows: sessionRows } = await pool.query(
+      `SELECT * FROM collar_sessions 
+       WHERE collar_id = $1 AND session_id = $2`,
+      [collar_id, session_id]
+    );
+
+    if (sessionRows.length === 0) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // Get session statistics
+    const { rows: statsRows } = await pool.query(
+      `SELECT 
+        COUNT(*) as chunk_count,
+        COALESCE(SUM((output_metric->>'steps_in_chunk')::numeric), 0) as total_steps,
+        MIN(created_at) as first_chunk_at,
+        MAX(created_at) as last_chunk_at,
+        MAX((output_metric->>'last_sample_number')::bigint) as last_sample_number
+       FROM collar_chunks
+       WHERE collar_id = $1 AND session_id = $2`,
+      [collar_id, session_id]
+    );
+
+    return res.json({
+      ok: true,
+      session: sessionRows[0],
+      statistics: statsRows[0]
+    });
+  } catch (err) {
+    console.error('GET /sessions/:collar_id/:session_id error', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* -----------------------------
    Step Counter Params Routes
    ----------------------------- */
 
 /**
  * POST /step-counter-params
  * Insert/update step counter parameters for a session (Sheep Algorithm - Jiang et al. 2023)
- * Body: { collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
- *         process_window_samples, run_start_threshold, shake_start_threshold }
  */
 app.post('/step-counter-params', async (req, res) => {
   try {
@@ -1076,7 +1178,17 @@ app.post('/step-counter-params', async (req, res) => {
       filter_window_size = 5,
       process_window_samples = 100,
       run_start_threshold = 30.0,
-      shake_start_threshold = 12.0
+      shake_start_threshold = 12.0,
+      sample_rate_hz = 32,
+      valley_window_n = 2,
+      run_end_threshold_high = 20.0,
+      run_end_threshold_low = 12.0,
+      run_peak_valley_diff = 20.0,
+      run_scaling_factor = 2.1,
+      baseline_step_samples = 29,
+      shake_peak_valley_diff = 12.0,
+      shake_regional_peak_max = 39.0,
+      shake_variance_threshold = 10.0
     } = req.body;
 
     if (!collar_id || !session_id) {
@@ -1093,8 +1205,12 @@ app.post('/step-counter-params', async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO step_counter_params
         (collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
-         process_window_samples, run_start_threshold, shake_start_threshold, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
+         process_window_samples, run_start_threshold, shake_start_threshold,
+         sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
+         run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
+         shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold,
+         created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW())
        ON CONFLICT (collar_id, session_id)
        DO UPDATE SET
          peak_threshold = EXCLUDED.peak_threshold,
@@ -1103,10 +1219,23 @@ app.post('/step-counter-params', async (req, res) => {
          process_window_samples = EXCLUDED.process_window_samples,
          run_start_threshold = EXCLUDED.run_start_threshold,
          shake_start_threshold = EXCLUDED.shake_start_threshold,
+         sample_rate_hz = EXCLUDED.sample_rate_hz,
+         valley_window_n = EXCLUDED.valley_window_n,
+         run_end_threshold_high = EXCLUDED.run_end_threshold_high,
+         run_end_threshold_low = EXCLUDED.run_end_threshold_low,
+         run_peak_valley_diff = EXCLUDED.run_peak_valley_diff,
+         run_scaling_factor = EXCLUDED.run_scaling_factor,
+         baseline_step_samples = EXCLUDED.baseline_step_samples,
+         shake_peak_valley_diff = EXCLUDED.shake_peak_valley_diff,
+         shake_regional_peak_max = EXCLUDED.shake_regional_peak_max,
+         shake_variance_threshold = EXCLUDED.shake_variance_threshold,
          updated_at = NOW()
        RETURNING *`,
       [collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
-       process_window_samples, run_start_threshold, shake_start_threshold]
+       process_window_samples, run_start_threshold, shake_start_threshold,
+       sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
+       run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
+       shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold]
     );
 
     // Clear from cache so next chunk will reload fresh params
@@ -1123,7 +1252,6 @@ app.post('/step-counter-params', async (req, res) => {
 /**
  * GET /step-counter-params/:collar_id
  * Get step counter parameters for a session
- * Query params: session_id (optional - uses active session if not provided)
  */
 app.get('/step-counter-params/:collar_id', async (req, res) => {
   try {
@@ -1162,6 +1290,16 @@ app.get('/step-counter-params/:collar_id', async (req, res) => {
           process_window_samples: 100,
           run_start_threshold: 30.0,
           shake_start_threshold: 12.0,
+          sample_rate_hz: 32,
+          valley_window_n: 2,
+          run_end_threshold_high: 20.0,
+          run_end_threshold_low: 12.0,
+          run_peak_valley_diff: 20.0,
+          run_scaling_factor: 2.1,
+          baseline_step_samples: 29,
+          shake_peak_valley_diff: 12.0,
+          shake_regional_peak_max: 39.0,
+          shake_variance_threshold: 10.0,
           status: 'defaults'
         }
       });
@@ -1181,7 +1319,6 @@ app.get('/step-counter-params/:collar_id', async (req, res) => {
 /**
  * POST /config
  * Insert new config record for a session
- * Body: { collar_id, session_id, emissivity, ssid, password }
  */
 app.post('/config', async (req, res) => {
   try {
@@ -1215,7 +1352,6 @@ app.post('/config', async (req, res) => {
 /**
  * GET /config/:collar_id
  * Get latest config for active session (or specific session if session_id provided)
- * Query params: session_id (optional)
  */
 app.get('/config/:collar_id', async (req, res) => {
   try {
@@ -1254,10 +1390,72 @@ app.get('/config/:collar_id', async (req, res) => {
   }
 });
 
+/* -----------------------------
+   ✅ NEW: Admin & Health Endpoints
+   ----------------------------- */
+
+/**
+ * POST /admin/cleanup-sessions
+ * Manual cleanup endpoint (only clears MEMORY, not DB)
+ */
+app.post('/admin/cleanup-sessions', async (req, res) => {
+  try {
+    const beforeCount = stepCounterBySession.size;
+    cleanupInactiveSessions();
+    const afterCount = stepCounterBySession.size;
+    
+    return res.json({
+      ok: true,
+      message: 'Memory caches cleared for inactive sessions. All DB records preserved.',
+      sessions_before: beforeCount,
+      sessions_after: afterCount,
+      cleaned_up: beforeCount - afterCount
+    });
+  } catch (err) {
+    console.error('Manual cleanup error', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /health
+ * Enhanced health check with memory usage stats
+ */
+app.get('/health', async (req, res) => {
+  const memUsage = process.memoryUsage();
+  
+  // Get total sessions in DB
+  let dbSessionCount = 0;
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*) as count FROM collar_sessions');
+    dbSessionCount = parseInt(rows[0].count);
+  } catch (err) {
+    console.error('Error counting DB sessions:', err);
+  }
+  
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    memory: {
+      rss_mb: Math.round(memUsage.rss / 1024 / 1024),
+      heap_used_mb: Math.round(memUsage.heapUsed / 1024 / 1024),
+      heap_total_mb: Math.round(memUsage.heapTotal / 1024 / 1024)
+    },
+    cache: {
+      active_sessions_in_memory: stepCounterBySession.size,
+      tracked_sessions_in_memory: sessionLastAccessTime.size,
+      total_sessions_in_db: dbSessionCount,
+      message: 'Memory caches auto-cleanup after 1 hour inactivity. DB records never deleted.'
+    },
+    active_collars: mappingByCollar.size
+  });
+});
 
 /* -----------------------------
    Start server
    ----------------------------- */
 app.listen(PORT, () => {
   console.log(`Collar backend listening on ${PORT}`);
+  console.log(`Memory cleanup runs every ${SESSION_CLEANUP_INTERVAL_MS / 60000} minutes`);
+  console.log(`Sessions inactive for >${SESSION_INACTIVE_THRESHOLD_MS / 60000} minutes will have memory cleared`);
 });
