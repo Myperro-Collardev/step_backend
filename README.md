@@ -1,55 +1,46 @@
-Dog Collar Backend — Express + PostgreSQL + IMU Processing
+Dog Collar Backend - Express + PostgreSQL + IMU Processing
 
-This backend powers a smart dog collar system with collar management, session tracking, IMU chunk ingestion, step counting, and temperature history reconstruction.
+Backend for the smart dog collar system: collars + sessions, IMU chunk ingestion, per-session step counting, and temperature history.
 
 Features
-
-- Create and update dog collars with detailed profiles (name, breed, age, weight, etc.)
-- Session system (multiple sessions per collar with composite keys)
-- Upload IMU chunks (accelerometer, gyro, temperature)
-- Step counting using a custom algorithm
-- Temperature timeline reconstruction
-- Timestamp alignment using real_time + start_sample
-- Per-chunk and cumulative metrics storage
+- Collar CRUD with dog metadata snapshots per session
+- Explicit session lifecycle (one active session per collar)
+- IMU chunk ingestion with per-session step counting
+- Temperature reconstruction from chunk timestamps
+- Per-session output metrics persisted on collars
 
 Tech Stack
-
 - Node.js
 - Express
 - PostgreSQL
 - Custom IMU decoder
-- In-memory StepCounter
+- In-memory StepCounter (seeded from DB per session)
 
 Installation
-
 ```bash
 git clone https://github.com/your-username/dog-collar-backend.git
 cd dog-collar-backend
 npm install
 ```
 
-Create a `.env` file:
-
+Environment
 ```
 DATABASE_URL=your-postgres-connection-url
 PORT=3000
 ```
 
-Run the server:
-
+Run the server
 ```bash
 node app.js
 ```
 
 API Endpoints
-1. POST /collars
+1) POST /collars
+- Creates or updates a collar.
+- When `new_session: true`, updates dog details, captures a snapshot for the session, creates/activates the session, and returns `session_id`.
+- When `new_session` is omitted/false, only collar details are updated (no new session).
 
-Create or update a collar. When `new_session: true` is included:
-- Updates the collar with new dog details
-- Creates a new session with a snapshot of those details
-- Stores historical record of dog metadata at time of session creation
-
-Example (Update dog details AND create new session)
+Example (create/update + new session)
 ```json
 {
   "collar_id": "C001",
@@ -68,43 +59,24 @@ Example (Update dog details AND create new session)
 }
 ```
 
-Response:
+Response
 ```json
 {
   "ok": true,
-  "collar": { ...updated collar data... },
+  "collar": { "collar_id": "C001", "dog_name": "Bruno", "age": 5, ... },
   "session_id": "111",
   "message": "Dog details updated and new session created with snapshot."
 }
 ```
 
-Example (Update collar details WITHOUT creating session)
+2) PUT /chunks
+- Ingests an IMU + temperature chunk.
+- Requires an active session; pass `new_session: true` to start one inline. If no active session exists and `new_session` is not sent, the request fails.
+- Steps are counted per `collar_id + session_id` using an in-memory StepCounter seeded from DB totals.
+- Persists per-session metrics on the collar under `output_metric.sessions[session_id]` and updates `output_metric.last_session_id`.
+
+Example (start new session + upload chunk)
 ```json
-{
-  "collar_id": "C001",
-  "dog_name": "Bruno",
-  "age": 6,
-  "weight": 37
-}
-```
-or
-```json
-{
-  "collar_id": "C001",
-  "dog_name": "Bruno",
-  "age": 6,
-  "weight": 37,
-  "new_session": false
-}
-```
-
-2. PUT /chunks
-
-Uploads an IMU + temperature chunk.
-
-Requires an active session. Use new_session: true to create a new session.
-
-Example (with new session)
 {
   "new_session": true,
   "data": {
@@ -118,157 +90,100 @@ Example (with new session)
     }
   }
 }
+```
 
-Example (using existing session)
+Example (use existing active session)
+```json
 {
   "data": {
-    "chunk_00000000": {
+    "chunk_00000001": {
       "collar_id": "C001",
       "imu_data": "BASE64_STRING",
-      "temp_data": [29.5, 29.4],
-      "temp_first_timestamp": "2025-12-05T20:21:26Z",
-      "real_time": "2025-12-05T20:21:26Z",
-      "start_sample": 0
+      "temp_data": [29.7, 29.6],
+      "temp_first_timestamp": "2025-12-05T20:22:26Z",
+      "real_time": "2025-12-05T20:22:26Z",
+      "start_sample": 1000
     }
   }
 }
-
-3. GET /collars
-
-Returns a list of all collars with basic info.
-
-Example Response
-```json
-[
-  {
-    "collar_id": "C001",
-    "dog_name": "Bruno",
-    "breed": "Labrador",
-    "created_at": "2025-12-05T20:00:00Z",
-    "output_metric": { "steps": 1234, "last_update": "..." }
-  }
-]
 ```
 
-4. GET /collars/:collar_id
+Response
+```json
+{
+  "ok": true,
+  "session_id_used": "111",
+  "chunk_id": 42,
+  "outputMetric": {
+    "steps_in_chunk": 32,
+    "cumulative_steps": 180,
+    "temp_avg_c": 29.55,
+    "session_id_used": "111",
+    "received_at": "2025-12-05T20:22:28Z"
+  }
+}
+```
 
-Returns complete collar details with reconstructed temperature history.
+3) GET /collars
+- Lists collars with basic info.
+- `output_metric` contains the per-session map and last session id (example: `{ "last_session_id": "111", "sessions": { "111": { "steps": 180, "last_chunk_id": 42, "last_update": "..." } } }`).
 
-Example Response
+4) GET /collars/:collar_id
+- Returns collar details and reconstructed temperatures.
+- Optional query `session_id` filters data to that session and validates the composite (404 if the session does not belong to the collar).
+- When `session_id` is provided:
+  - `session_steps` is the sum of `steps_in_chunk` for that session.
+  - `temperature_list` is filtered to that session only.
+  - `output_metric` is scoped to the requested session: `{ steps, session_id, session_block }` where `session_block` comes from `output_metric.sessions[session_id]`.
+- Without `session_id`, all temperatures are returned and `output_metric` is the stored collar-level blob.
+
+Example
+```http
+GET /collars/C001?session_id=111
+```
+
+Example response (session scoped)
 ```json
 {
   "collar_id": "C001",
   "dog_name": "Bruno",
-  "breed": "Labrador",
-  "age": 3,
-  "height": 60,
-  "weight": 30,
-  "sex": "Male",
   "temperature_list": [
     { "temp_c": 29.5, "timestamp": "2025-12-05T20:21:26Z" },
     { "temp_c": 29.4, "timestamp": "2025-12-05T20:21:27Z" }
   ],
-  "output_metric": { "steps": 1234 }
+  "session_steps": 180,
+  "output_metric": {
+    "steps": 180,
+    "session_id": "111",
+    "session_block": {
+      "steps": 180,
+      "last_chunk_id": 42,
+      "last_update": "2025-12-05T20:22:28Z"
+    }
+  }
 }
 ```
 
-Session Logic
+Session lifecycle
+- Only one active session per collar.
+- Start a session via `POST /collars` with `new_session: true` or `PUT /chunks` with `new_session: true` (if a collar exists).
+- Chunk uploads are rejected if no active session exists and `new_session` is not sent.
 
-**When `new_session: true` is sent:**
-1. Collar dog details are **updated** with new values
-2. A new session is created and marked as active
-3. Dog metadata (name, breed, age, weight, sex, etc.) is **captured and stored as a snapshot** in that session
-4. Previous session(s) are deactivated
-5. Complete historical record is maintained of dog state at each session
+Temperature processing
+- Each chunk includes `temp_data[]` and `temp_first_timestamp`.
+- Reconstructed timestamps: $timestamp_i = temp\_first\_timestamp + i \times 1000\,ms$.
 
-**When `new_session: false` or omitted:**
-- Only collar details are updated
-- No new session is created
-- Existing active session continues unchanged
+Step counting (per session)
+- IMU samples are decoded, mapped to timestamps using `real_time` + `start_sample` when available.
+- Algorithm: gravity smoothing, rotate to global Z, DV filtering, zero-line estimation, falling zero-cross detection, frequency gate (2.25-3.75 Hz), then increment.
+- Counter key is `collar_id:session_id`; on restart, the counter seeds from DB by summing `steps_in_chunk` for that session.
 
-**Key Features:**
-- Only one session can be active at a time per collar
-- Chunk uploads require an active session
-- Query all sessions to see complete history of dog metadata changes over time
-- Each session has a unique session_id (e.g., "111", "222", or random hex)
-- Dog metadata snapshots allow tracking how dog profile evolved
-
-**Example Timeline:**
-```
-Session 1 (age: 3) → 2 chunks uploaded
-Session 2 (age: 4) → 1 chunk uploaded  
-Session 3 (age: 5) → In progress
-```
-
-Temperature Processing
-
-Each chunk includes:
-- `temp_data[]` - Array of temperature readings
-- `temp_first_timestamp` - Starting timestamp
-
-Timestamps are reconstructed as:
-```
-timestamp[i] = temp_first_timestamp + (i * 1000ms)
-```
-
-All chunk temperatures are merged into `temperature_list`.
-
-Step Counting Algorithm
-
-Processing pipeline:
-
-1. Decode IMU base64
-2. Gravity smoothing
-3. Rotate sample to global Z-axis
-4. DV filtering
-5. Zero-line estimation
-6. Falling zero-cross detection
-7. Frequency validation (2.25–3.75 Hz)
-8. Step increment
-9. Store steps per chunk and cumulative steps
-
-Database Tables
-collars
-
-Stores collar info and dog details:
-- collar_id (primary key)
-- dog_name
-- breed
-- age (INTEGER)
-- height
-- weight
-- sex
-- coat_type
-- temperature_irgun
-- collar_orientation
-- medical_info
-- remarks
-- output_metric (JSON)
-- created_at, updated_at
-
-collar_sessions
-
-Tracks active and inactive sessions:
-- collar_id
-- session_id
-- active (boolean)
-- created_by
-- created_at
-
-collar_chunks
-
-Stores IMU data, temperature, timestamps, and metrics:
-- chunk_id (primary key)
-- collar_id
-- session_id (composite key)
-- chunk_json
-- steps_this_chunk
-- cumulative_steps
-- temperature_list (JSON)
-- created_at
+Data model (simplified)
+- `collars`: collar profile, `output_metric` JSON (includes `last_session_id` and `sessions` map), mapping_json for timestamp alignment.
+- `collar_sessions`: one row per session with `active` flag and dog metadata snapshot at creation.
+- `collar_chunks`: chunk payloads, `session_id`, temperature array, and per-chunk metrics (including `steps_in_chunk`).
 
 Project Structure
-
 ```
 app.js          # Main application file with all endpoints and logic
 server.js       # Basic server setup (alternative entry point)
