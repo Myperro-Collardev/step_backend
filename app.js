@@ -1,44 +1,23 @@
 /**
- * app.js - fixed version with memory leak and step counting fixes
- * Express + Postgres service for collars with composite sessions
- *
- * Endpoints:
- *  POST /collars    -> create collar (optional new_session:true), or update (requires collar_id+session_id)
- *  GET  /collars
- *  GET  /collars/:id
- *  PUT  /chunks     -> ingest chunk (client sends collar_id + chunk_json only)
- *  GET  /sessions/:collar_id
- *  GET  /sessions/:collar_id/:session_id
- *  POST /step-counter-params
- *  GET  /step-counter-params/:collar_id
- *  POST /config
- *  GET  /config/:collar_id
- *  GET  /health
- *  POST /admin/cleanup-sessions
- *
- * Notes:
- *  - chunk_json must include imu_data (base64)
- *  - POST /collars with { new_session: true } will create+activate a new session and return it
- *  - Memory cleanup runs every 30 minutes (clears inactive session caches, DB records preserved)
+ * app.js - Simplified Step Counter + Firebase
+ * Calculate steps from IMU data and send to Firebase
+ * 
+ * Endpoint:
+ *  POST /process-chunk -> Calculate steps and temperature, send to Firebase
+ *  GET /health -> Health check
+ * 
+ * Firebase Rules: Public read/write enabled (no authentication required)
  */
 require('dotenv').config();
 
 const express = require('express');
 const bodyParser = require('body-parser');
-const { Pool } = require('pg');
-const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT),
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  // Enable SSL for AWS Aurora
-  ssl: { rejectUnauthorized: false },
-});
+// Firebase REST API URLs (public read/write)
+const FIREBASE_STEPS_URL = process.env.FIREBASE_STEPS_URL || 'https://myperro-gps-default-rtdb.firebaseio.com/Health/Steps.json';
+const FIREBASE_TEMP_URL = process.env.FIREBASE_TEMP_URL || 'https://myperro-gps-default-rtdb.firebaseio.com/Health/Temp.json';
 
 const app = express();
 
@@ -350,196 +329,7 @@ class StepCounter {
   }
 }
 
-/* -----------------------------
-   In-memory maps for state (per-collar)
-   ✅ FIXED: Memory leak prevention with cleanup
-   ----------------------------- */
-// Track steps per active session (keyed by ${collar_id}:${session_id})
-const stepCounterBySession = new Map();
-const mappingByCollar = new Map();
 
-// ✅ Track timestamp for memory cleanup (NOT for deleting DB records)
-const sessionLastAccessTime = new Map();
-const SESSION_CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
-const SESSION_INACTIVE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
-
-// ✅ Track last sample number instead of buffering entire sample arrays
-const lastSampleNumberBySession = new Map();
-
-// ✅ Cleanup IN-MEMORY caches only - DB records stay forever
-function cleanupInactiveSessions() {
-  const now = Date.now();
-  const keysToDelete = [];
-
-  for (const [key, lastAccess] of sessionLastAccessTime.entries()) {
-    if (now - lastAccess > SESSION_INACTIVE_THRESHOLD_MS) {
-      keysToDelete.push(key);
-    }
-  }
-
-  for (const key of keysToDelete) {
-    // Only clear memory caches - DB records remain intact
-    stepCounterBySession.delete(key);
-    lastSampleNumberBySession.delete(key);
-    sessionLastAccessTime.delete(key);
-    console.log(`[Memory Cleanup] Cleared in-memory cache for inactive session: ${key} (DB records preserved)`);
-  }
-
-  if (keysToDelete.length > 0) {
-    console.log(`[Memory Cleanup] Freed memory for ${keysToDelete.length} inactive sessions. All DB data preserved.`);
-  }
-}
-
-// Start cleanup interval
-setInterval(cleanupInactiveSessions, SESSION_CLEANUP_INTERVAL_MS);
-
-/* -----------------------------
-   Helper to update session access time
-   ----------------------------- */
-function touchSession(collar_id, session_id) {
-  const key = `${collar_id}:${session_id}`;
-  sessionLastAccessTime.set(key, Date.now());
-}
-
-/* -----------------------------
-   ✅ Enhanced: Load last processed sample from DB if not in memory
-   ----------------------------- */
-async function getLastProcessedSampleNumber(collar_id, session_id) {
-  const sessionKey =  `${collar_id}:${session_id}`;
-  
-  // Check memory first
-  if (lastSampleNumberBySession.has(sessionKey)) {
-    return lastSampleNumberBySession.get(sessionKey);
-  }
-  
-  // If not in memory, load from DB (happens after memory cleanup or restart)
-  const { rows } = await pool.query(
-    `SELECT MAX((output_metric->>'last_sample_number')::bigint) as last_sample
-     FROM collar_chunks
-     WHERE collar_id = $1 AND session_id = $2`,
-    [collar_id, session_id]
-  );
-  
-  const lastSample = rows[0]?.last_sample || null;
-  
-  if (lastSample !== null) {
-    // Cache it back in memory
-    lastSampleNumberBySession.set(sessionKey, lastSample);
-    console.log(`[DB Recovery] Loaded last_sample_number=${lastSample} for session ${sessionKey} from DB`);
-  }
-  
-  return lastSample;
-}
-
-// Sum all steps_in_chunk for a given collar+session from the DB
-async function getSessionStepTotal(collar_id, session_id) {
-  const { rows } = await pool.query(
-    `SELECT COALESCE(SUM((output_metric->>'steps_in_chunk')::numeric), 0) AS total
-       FROM collar_chunks
-      WHERE collar_id = $1 AND session_id = $2`,
-    [collar_id, session_id]
-  );
-  return Number(rows[0].total || 0);
-}
-
-async function getStepCounterParams(collar_id, session_id) {
-  const { rows } = await pool.query(
-    `SELECT peak_threshold, peak_window_n, filter_window_size, 
-            process_window_samples, run_start_threshold, shake_start_threshold,
-            sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
-            run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
-            shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold
-     FROM step_counter_params
-     WHERE collar_id = $1 AND session_id = $2
-     LIMIT 1`,
-    [collar_id, session_id]
-  );
-  return rows.length > 0 ? rows[0] : {};
-}
-
-async function getOrInitStepCounter(collar_id, session_id) {
-  const key = `${collar_id}:${session_id}`;
-  let sc = stepCounterBySession.get(key);
-  if (sc) return sc;
-
-  // Fetch params from DB for this session
-  const params = await getStepCounterParams(collar_id, session_id);
-  sc = new StepCounter(params);
-  // Seed from DB so restarts preserve counts
-  sc.step_count = await getSessionStepTotal(collar_id, session_id);
-  stepCounterBySession.set(key, sc);
-  return sc;
-}
-
-/* -----------------------------
-   Sessions helpers (collar_sessions table)
-   ----------------------------- */
-async function generateAndInsertSession(collar_id, created_by = 'api', dogMetadata = {}) {
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query(
-      'SELECT session_id FROM collar_sessions WHERE collar_id = $1',
-      [collar_id]
-    );
-    const used = new Set(rows.map(r => r.session_id));
-
-    let session_id = null;
-    for (let k = 1; k <= 9; k++) {
-      const t = String(k).repeat(3);
-      if (!used.has(t)) {
-        session_id = t;
-        break;
-      }
-    }
-    if (!session_id) {
-      session_id = crypto.randomBytes(12).toString('hex');
-    }
-
-    await client.query('BEGIN');
-    await client.query(
-      'UPDATE collar_sessions SET active = FALSE WHERE collar_id = $1',
-      [collar_id]
-    );
-    await client.query(
-      'INSERT INTO collar_sessions (collar_id, session_id, active, created_by, dog_metadata, created_at) VALUES ($1,$2,TRUE,$3,$4,NOW())',
-      [collar_id, session_id, created_by, JSON.stringify(dogMetadata)]
-    );
-    await client.query('COMMIT');
-    return session_id;
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
-    throw e;
-  } finally {
-    client.release();
-  }
-}
-
-async function getActiveSessionForCollar(collar_id) {
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query(
-      'SELECT session_id FROM collar_sessions WHERE collar_id = $1 AND active = TRUE LIMIT 1',
-      [collar_id]
-    );
-    return rows.length ? rows[0].session_id : null;
-  } finally {
-    client.release();
-  }
-}
-
-async function validateCompositeSession(collar_id, session_id) {
-  if (!collar_id || !session_id) return false;
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query(
-      'SELECT 1 FROM collar_sessions WHERE collar_id = $1 AND session_id = $2 LIMIT 1',
-      [collar_id, session_id]
-    );
-    return rows.length > 0;
-  } finally {
-    client.release();
-  }
-}
 
 /* -----------------------------
    Decode chunk JSON (base64 -> samples)
@@ -590,333 +380,19 @@ function decodeChunkJson(chunkObj) {
   };
 }
 
-/* -----------------------------
-   Map samples to timestamps
-   ----------------------------- */
-function mapSamplesToTimestamps(decoded, persistedMapping) {
-  const nominalPeriodMs = 10;
-  let mapping = null;
-  if (decoded.real_time && decoded.start_sample !== null) {
-    const realEpoch = Date.parse(decoded.real_time);
-    if (!Number.isNaN(realEpoch)) {
-      mapping = {
-        start_sample: decoded.start_sample,
-        real_time_epoch_ms: realEpoch,
-        nominalPeriodMs
-      };
-    }
-  }
-  const useMapping = mapping || persistedMapping || null;
-  const mapped = decoded.samples.map(s => {
-    let ts;
-    if (useMapping) {
-      const dtSamples = s.sample_number - useMapping.start_sample;
-      ts = useMapping.real_time_epoch_ms + dtSamples * useMapping.nominalPeriodMs;
-    } else {
-      ts = s.timestamp_ms_dev;
-    }
-    return {
-      ts,
-      ax: s.ax,
-      ay: s.ay,
-      az: s.az,
-      gx: s.gx,
-      gy: s.gy,
-      gz: s.gz,
-      sample_number: s.sample_number
-    };
-  });
-  return { mapped, mapping };
-}
 
-/* -----------------------------
-   DB helpers: collars + chunks + output metric
-   ----------------------------- */
-
-async function upsertCollarCreateOnly(collarBody) {
-  const client = await pool.connect();
-  try {
-    const res = await client.query(
-      `INSERT INTO collars (
-         collar_id, dog_name, breed, coat_type, height, weight, sex, age,
-         temperature_irgun, collar_orientation, medical_info, remarks, created_at
-       )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
-       ON CONFLICT (collar_id) DO UPDATE SET
-         dog_name = COALESCE(EXCLUDED.dog_name, collars.dog_name),
-         breed = COALESCE(EXCLUDED.breed, collars.breed),
-         coat_type = COALESCE(EXCLUDED.coat_type, collars.coat_type),
-         height = COALESCE(EXCLUDED.height, collars.height),
-         weight = COALESCE(EXCLUDED.weight, collars.weight),
-         sex = COALESCE(EXCLUDED.sex, collars.sex),
-         age = COALESCE(EXCLUDED.age, collars.age),
-         temperature_irgun = COALESCE(EXCLUDED.temperature_irgun, collars.temperature_irgun),
-         collar_orientation = COALESCE(EXCLUDED.collar_orientation, collars.collar_orientation),
-         medical_info = COALESCE(EXCLUDED.medical_info, collars.medical_info),
-         remarks = COALESCE(EXCLUDED.remarks, collars.remarks),
-         updated_at = NOW()
-       RETURNING *;`,
-      [
-        collarBody.collar_id,
-        collarBody.dog_name ?? null,
-        collarBody.breed ?? null,
-        collarBody.coat_type ?? null,
-        collarBody.height ?? null,
-        collarBody.weight ?? null,
-        collarBody.sex ?? null,
-        collarBody.age ?? null,
-        collarBody.temperature_irgun ?? null,
-        collarBody.collar_orientation ?? null,
-        collarBody.medical_info ?? null,
-        collarBody.remarks ?? null
-      ]
-    );
-    return res.rows[0];
-  } finally {
-    client.release();
-  }
-}
-
-async function insertChunkRow(collar_id, session_id, decoded, summary, outputMetric) {
-  const client = await pool.connect();
-  try {
-    const q = `INSERT INTO collar_chunks (
-      collar_id, session_id, chunk_key, start_sample, num_samples, nominal_period_ms,
-      real_time_iso, temp_first_timestamp, temp_data,
-      raw_base64_json, raw_imu_base64, sensor_summary, output_metric, created_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()) RETURNING *;`;
-
-    const chunkKey =
-      decoded && decoded.samples.length
-        ? `chunk_${decoded.samples[0].sample_number}`
-        : `chunk_${Date.now()}`;
-
-    const vals = [
-      collar_id,
-      session_id,
-      chunkKey,
-      decoded.start_sample,
-      decoded.samples.length,
-      10,
-      decoded.real_time,
-      decoded.temp_first_timestamp,
-      JSON.stringify(decoded.temp_data || []),
-      decoded.raw_base64_json,
-      decoded.raw_base64_json
-        ? JSON.parse(decoded.raw_base64_json).imu_data
-        : null,
-      JSON.stringify(summary || {}),
-      JSON.stringify(outputMetric || {})
-    ];
-
-    const r = await client.query(q, vals);
-    return r.rows[0];
-  } finally {
-    client.release();
-  }
-}
-
-async function updateCollarOutputMetric(collar_id, session_id, sessionMetric) {
-  const client = await pool.connect();
-  try {
-    await client.query(
-      `UPDATE collars
-         SET output_metric = jsonb_set(
-               jsonb_set(COALESCE(output_metric, '{}'::jsonb),
-                         ARRAY['sessions', $2], $3::jsonb, true),
-               ARRAY['last_session_id'], to_jsonb($2)),
-             updated_at = NOW()
-       WHERE collar_id = $1`,
-      [collar_id, session_id, JSON.stringify(sessionMetric)]
-    );
-  } finally {
-    client.release();
-  }
-}
 
 /* -----------------------------
    Routes
    ----------------------------- */
 
 /**
- * POST /collars
- * Create collar if missing. If body.new_session === true, create & activate session and return session_id.
+ * POST /process-chunk
+ * Process IMU chunk, calculate steps, send to Firebase
  */
-app.post('/collars', async (req, res) => {
+app.post('/process-chunk', async (req, res) => {
   try {
-    const body = req.body;
-    if (!body || !body.collar_id) {
-      return res.status(400).json({ error: 'collar_id required' });
-    }
-
-    // ⭐ Create new session when user explicitly asks
-    if (body.new_session === true || body.new_session === "true" || body.new_session === 1) {
-      // FIRST: Update collar with new dog details
-      const collar = await upsertCollarCreateOnly(body);
-
-      // THEN: Capture dog details as snapshot for this session
-      const dogMetadata = {
-        dog_name: collar.dog_name,
-        breed: collar.breed,
-        age: collar.age,
-        height: collar.height,
-        weight: collar.weight,
-        sex: collar.sex,
-        coat_type: collar.coat_type,
-        temperature_irgun: collar.temperature_irgun,
-        collar_orientation: collar.collar_orientation,
-        medical_info: collar.medical_info,
-        remarks: collar.remarks
-      };
-
-      // Create new session with updated dog metadata snapshot
-      const session_id = await generateAndInsertSession(body.collar_id, 'user_request', dogMetadata);
-      return res.json({
-        ok: true,
-        collar,
-        session_id,
-        message: 'Dog details updated and new session created with snapshot.'
-      });
-    }
-
-    // Default: Update collar details WITHOUT creating a new session
-    const collar = await upsertCollarCreateOnly(body);
-    return res.json({ ok: true, collar, message: 'Dog details updated' });
-
-  } catch (err) {
-    console.error('POST /collars error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /collars
-app.get('/collars', async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      'SELECT collar_id, dog_name, breed, created_at, output_metric FROM collars ORDER BY created_at DESC'
-    );
-    return res.json(rows);
-  } catch (err) {
-    console.error('GET /collars error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /collars/:collar_id
-app.get('/collars/:collar_id', async (req, res) => {
-  try {
-    const cid = req.params.collar_id;
-    const sessionId = req.query.session_id;  // Optional: filter by session
-
-    // Fetch collar basic data
-    const collarRes = await pool.query(
-      'SELECT * FROM collars WHERE collar_id = $1',
-      [cid]
-    );
-
-    if (collarRes.rows.length === 0) {
-      return res.status(404).json({ error: 'not found' });
-    }
-
-    const collar = collarRes.rows[0];
-
-    // If sessionId provided, ensure it exists for this collar
-    if (sessionId) {
-      const { rows: sessionRows } = await pool.query(
-        'SELECT 1 FROM collar_sessions WHERE collar_id = $1 AND session_id = $2 LIMIT 1',
-        [cid, sessionId]
-      );
-      if (sessionRows.length === 0) {
-        return res.status(404).json({ error: 'session not found for this collar' });
-      }
-    }
-
-    // Session-scoped steps (sum of steps_in_chunk for this session)
-    let session_steps = null;
-    if (sessionId) {
-      session_steps = await getSessionStepTotal(cid, sessionId);
-    }
-
-    // Fetch temperature readings - optionally filtered by session_id
-    let chunksRes;
-    if (sessionId) {
-      // Get temperature data ONLY for this specific session
-      chunksRes = await pool.query(
-        `SELECT temp_data, temp_first_timestamp
-         FROM collar_chunks
-         WHERE collar_id = $1 AND session_id = $2
-         ORDER BY created_at ASC`,
-        [cid, sessionId]
-      );
-    } else {
-      // Get ALL temperature readings from chunks (backward compatibility)
-      chunksRes = await pool.query(
-        `SELECT temp_data, temp_first_timestamp
-         FROM collar_chunks
-         WHERE collar_id = $1
-         ORDER BY created_at ASC`,
-        [cid]
-      );
-    }
-
-    const temperature_list = [];
-
-    for (const chunk of chunksRes.rows) {
-      const temps = chunk.temp_data || [];
-      let t0 = chunk.temp_first_timestamp
-        ? new Date(chunk.temp_first_timestamp).getTime()
-        : null;
-
-      // If timestamp missing, skip this chunk
-      if (!t0) continue;
-
-      // assume 1-second interval between samples
-      const intervalMs = 1000;
-
-      temps.forEach((tempValue, index) => {
-        temperature_list.push({
-          temp_c: tempValue,
-          timestamp: new Date(t0 + index * intervalMs).toISOString()
-        });
-      });
-    }
-
-    // Build response with optional session-scoped steps
-    const responsePayload = {
-      ...collar,
-      temperature_list
-    };
-
-    if (session_steps !== null) {
-      responsePayload.session_steps = session_steps;
-
-      // If stored per-session metrics exist, surface that session's block
-      const sessionsMetric = (collar.output_metric || {}).sessions || {};
-      const sessionBlock = sessionsMetric[sessionId] || {};
-
-      responsePayload.output_metric = {
-        ...collar.output_metric,
-        steps: session_steps,
-        session_id: sessionId,
-        session_block: sessionBlock
-      };
-    }
-
-    return res.json(responsePayload);
-
-  } catch (err) {
-    console.error("GET /collars/:collar_id error", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * PUT /chunks
- * ✅ FIXED: Prevents double-counting and memory leaks
- */
-app.put('/chunks', async (req, res) => {
-  try {
-    const { data, new_session } = req.body;
+    const { data } = req.body;
 
     if (!data || typeof data !== 'object') {
       return res.status(400).json({ error: "data object required" });
@@ -925,554 +401,69 @@ app.put('/chunks', async (req, res) => {
     const chunkKeyName = Object.keys(data)[0];
     const chunkObj = data[chunkKeyName];
 
-    const collar_id = chunkObj.collar_id;
-    if (!collar_id) {
-      return res.status(400).json({ error: "collar_id missing inside chunk" });
-    }
-
-    // Check collar exists
-    const { rows: collarRows } = await pool.query(
-      "SELECT * FROM collars WHERE collar_id = $1",
-      [collar_id]
-    );
-
-    if (collarRows.length === 0) {
-      return res.status(404).json({
-        error: "collar not found; create collar first"
-      });
-    }
-
-    // Get existing active session
-    let session_id = await getActiveSessionForCollar(collar_id);
-
-    // ✔ Only create new session IF user explicitly asks
-    if (new_session === true) {
-      // Fetch current dog metadata from collar table
-      const dogMetadata = {
-        dog_name: collarRows[0].dog_name,
-        breed: collarRows[0].breed,
-        age: collarRows[0].age,
-        height: collarRows[0].height,
-        weight: collarRows[0].weight,
-        sex: collarRows[0].sex,
-        coat_type: collarRows[0].coat_type,
-        temperature_irgun: collarRows[0].temperature_irgun,
-        collar_orientation: collarRows[0].collar_orientation,
-        medical_info: collarRows[0].medical_info,
-        remarks: collarRows[0].remarks
-      };
-      session_id = await generateAndInsertSession(collar_id, "manual", dogMetadata);
-      
-      // ✅ Clear old session MEMORY cache (DB records stay)
-      const oldKey = `${collar_id}:${session_id}`;
-      stepCounterBySession.delete(oldKey);
-      lastSampleNumberBySession.delete(oldKey);
-      sessionLastAccessTime.delete(oldKey);
-      console.log(`[New Session] Cleared memory cache for ${oldKey}, DB records preserved`);
-    }
-
-    // ❌ Do NOT create session automatically
-    if (!session_id) {
-      return res.status(400).json({
-        error: "No active session. Call PUT /chunks with {new_session: true} to start a new session."
-      });
-    }
-
-    // ✅ Update session access time
-    touchSession(collar_id, session_id);
-
-    // -----------------------
-    // Decode + Process IMU
-    // -----------------------
+    // Decode IMU data
     const decoded = decodeChunkJson(chunkObj);
-    const persistedMapping = collarRows[0].mapping_json || null;
-    const { mapped, mapping } = mapSamplesToTimestamps(decoded, persistedMapping);
 
-    if (mapping) {
-      await pool.query(
-        "UPDATE collars SET mapping_json=$2 WHERE collar_id=$1",
-        [collar_id, mapping]
-      );
-      mappingByCollar.set(collar_id, mapping);
-    }
+    // Calculate steps
+    const sc = new StepCounter();
+    const steps = sc.processChunk(decoded.samples);
 
-    // Per-session step counter (persists across restarts using DB seed)
-    const sc = await getOrInitStepCounter(collar_id, session_id);
+    // Process temperature
+    const temperature_list = [];
+    if (decoded.temp_data && decoded.temp_data.length > 0 && decoded.temp_first_timestamp) {
+      let t0 = new Date(decoded.temp_first_timestamp).getTime();
+      const intervalMs = 1000;
 
-    // ✅ CORRECTED step counting logic - only process NEW samples
-    const sessionKey = `${collar_id}:${session_id}`;
-    
-    // ✅ Load last processed sample (from memory or DB)
-    const lastProcessedSampleNumber = await getLastProcessedSampleNumber(collar_id, session_id);
-    
-    // Filter out samples we've already processed
-    let samplesToProcess = mapped;
-    
-    if (lastProcessedSampleNumber !== null) {
-      // Only process samples with sample_number > last processed
-      samplesToProcess = mapped.filter(s => s.sample_number > lastProcessedSampleNumber);
-      
-      console.log(`Session ${sessionKey}: Last processed sample=${lastProcessedSampleNumber}, ` +
-                  `Current chunk has ${mapped.length} samples, ` +
-                  `Processing ${samplesToProcess.length} new samples`);
-    } else {
-      console.log(`Session ${sessionKey}: First chunk, processing all ${samplesToProcess.length} samples`);
-    }
-
-    // Only process if we have new samples
-    let stepsInChunk = 0;
-    let lastSampleNumber = lastProcessedSampleNumber;
-    
-    if (samplesToProcess.length > 0) {
-      const before = sc.step_count;
-      sc.processChunk(samplesToProcess);
-      const after = sc.step_count;
-      stepsInChunk = after - before;
-
-      // ✅ Update the last processed sample number (in memory AND will save to DB)
-      const lastSampleInChunk = mapped[mapped.length - 1];
-      lastSampleNumber = lastSampleInChunk.sample_number;
-      lastSampleNumberBySession.set(sessionKey, lastSampleNumber);
-    } else {
-      console.warn(`Session ${sessionKey}: No new samples to process (possible duplicate chunk)`);
-    }
-
-    // ✅ Enhanced output metric - includes last_sample_number for DB persistence
-    const outputMetric = {
-      steps_in_chunk: stepsInChunk,
-      cumulative_steps: sc.step_count,
-      samples_processed: samplesToProcess.length,
-      total_samples_in_chunk: mapped.length,
-      last_sample_number: lastSampleNumber, // ✅ Store in DB for recovery
-      temp_avg_c: decoded.temp_data?.length
-        ? decoded.temp_data.reduce((a, b) => a + b, 0) / decoded.temp_data.length
-        : null,
-      session_id_used: session_id,
-      received_at: new Date().toISOString()
-    };
-
-    const chunkRow = await insertChunkRow(
-      collar_id, session_id, decoded, {}, outputMetric
-    );
-
-    // Persist latest session steps onto collar keyed by collar+session
-    await updateCollarOutputMetric(collar_id, session_id, {
-      steps: sc.step_count,
-      last_chunk_id: chunkRow.id,
-      last_sample_number: lastSampleNumber, // ✅ Also store here
-      last_update: new Date().toISOString()
-    });
-
-    return res.json({
-      ok: true,
-      session_id_used: session_id,
-      chunk_id: chunkRow.id,
-      outputMetric
-    });
-
-  } catch (err) {
-    console.error("PUT /chunks error", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/* -----------------------------
-   ✅ NEW: Session Management Endpoints
-   ----------------------------- */
-
-/**
- * GET /sessions/:collar_id
- * List all sessions for a collar (active + inactive)
- */
-app.get('/sessions/:collar_id', async (req, res) => {
-  try {
-    const { collar_id } = req.params;
-
-    const { rows } = await pool.query(
-      `SELECT 
-        cs.session_id,
-        cs.active,
-        cs.created_by,
-        cs.dog_metadata,
-        cs.created_at,
-        COUNT(cc.id) as chunk_count,
-        COALESCE(SUM((cc.output_metric->>'steps_in_chunk')::numeric), 0) as total_steps,
-        MAX(cc.created_at) as last_chunk_at
-       FROM collar_sessions cs
-       LEFT JOIN collar_chunks cc ON cs.collar_id = cc.collar_id AND cs.session_id = cc.session_id
-       WHERE cs.collar_id = $1
-       GROUP BY cs.session_id, cs.active, cs.created_by, cs.dog_metadata, cs.created_at
-       ORDER BY cs.created_at DESC`,
-      [collar_id]
-    );
-
-    return res.json({
-      ok: true,
-      collar_id,
-      sessions: rows,
-      total_sessions: rows.length
-    });
-  } catch (err) {
-    console.error('GET /sessions/:collar_id error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /sessions/:collar_id/:session_id
- * Get detailed session data
- */
-app.get('/sessions/:collar_id/:session_id', async (req, res) => {
-  try {
-    const { collar_id, session_id } = req.params;
-
-    // Get session info
-    const { rows: sessionRows } = await pool.query(
-      `SELECT * FROM collar_sessions 
-       WHERE collar_id = $1 AND session_id = $2`,
-      [collar_id, session_id]
-    );
-
-    if (sessionRows.length === 0) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    // Get session statistics
-    const { rows: statsRows } = await pool.query(
-      `SELECT 
-        COUNT(*) as chunk_count,
-        COALESCE(SUM((output_metric->>'steps_in_chunk')::numeric), 0) as total_steps,
-        MIN(created_at) as first_chunk_at,
-        MAX(created_at) as last_chunk_at,
-        MAX((output_metric->>'last_sample_number')::bigint) as last_sample_number
-       FROM collar_chunks
-       WHERE collar_id = $1 AND session_id = $2`,
-      [collar_id, session_id]
-    );
-
-    return res.json({
-      ok: true,
-      session: sessionRows[0],
-      statistics: statsRows[0]
-    });
-  } catch (err) {
-    console.error('GET /sessions/:collar_id/:session_id error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/* -----------------------------
-   Step Counter Params Routes
-   ----------------------------- */
-
-/**
- * POST /step-counter-params
- * Insert/update step counter parameters for a session (Sheep Algorithm - Jiang et al. 2023)
- * Only updates fields that are provided in the request body
- */
-app.post('/step-counter-params', async (req, res) => {
-  try {
-    const { collar_id, session_id, ...params } = req.body;
-
-    if (!collar_id || !session_id) {
-      return res.status(400).json({ error: 'collar_id and session_id required' });
-    }
-
-    // Validate session exists for this collar
-    const isValid = await validateCompositeSession(collar_id, session_id);
-    if (!isValid) {
-      return res.status(404).json({ error: 'Invalid collar_id/session_id combination' });
-    }
-
-    // Default values for initial insert
-    const defaults = {
-      peak_threshold: 12.0,
-      peak_window_n: 4,
-      filter_window_size: 5,
-      process_window_samples: 100,
-      run_start_threshold: 30.0,
-      shake_start_threshold: 12.0,
-      sample_rate_hz: 32,
-      valley_window_n: 2,
-      run_end_threshold_high: 20.0,
-      run_end_threshold_low: 12.0,
-      run_peak_valley_diff: 20.0,
-      run_scaling_factor: 2.1,
-      baseline_step_samples: 29,
-      shake_peak_valley_diff: 12.0,
-      shake_regional_peak_max: 39.0,
-      shake_variance_threshold: 10.0
-    };
-
-    // Check if record exists
-    const { rows: existing } = await pool.query(
-      `SELECT * FROM step_counter_params WHERE collar_id = $1 AND session_id = $2`,
-      [collar_id, session_id]
-    );
-
-    let result;
-    if (existing.length === 0) {
-      // Insert with defaults + provided params
-      const insertParams = { ...defaults, ...params };
-      const { rows } = await pool.query(
-        `INSERT INTO step_counter_params
-          (collar_id, session_id, peak_threshold, peak_window_n, filter_window_size, 
-           process_window_samples, run_start_threshold, shake_start_threshold,
-           sample_rate_hz, valley_window_n, run_end_threshold_high, run_end_threshold_low,
-           run_peak_valley_diff, run_scaling_factor, baseline_step_samples,
-           shake_peak_valley_diff, shake_regional_peak_max, shake_variance_threshold,
-           created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW())
-         RETURNING *`,
-        [collar_id, session_id, 
-         insertParams.peak_threshold, insertParams.peak_window_n, insertParams.filter_window_size,
-         insertParams.process_window_samples, insertParams.run_start_threshold, insertParams.shake_start_threshold,
-         insertParams.sample_rate_hz, insertParams.valley_window_n, insertParams.run_end_threshold_high, 
-         insertParams.run_end_threshold_low, insertParams.run_peak_valley_diff, insertParams.run_scaling_factor,
-         insertParams.baseline_step_samples, insertParams.shake_peak_valley_diff, insertParams.shake_regional_peak_max,
-         insertParams.shake_variance_threshold]
-      );
-      result = rows[0];
-    } else {
-      // Update only provided fields
-      const updateFields = [];
-      const updateValues = [collar_id, session_id];
-      let paramIndex = 3;
-
-      for (const [key, value] of Object.entries(params)) {
-        if (defaults.hasOwnProperty(key)) {
-          updateFields.push(`${key} = $${paramIndex}`);
-          updateValues.push(value);
-          paramIndex++;
-        }
-      }
-
-      if (updateFields.length === 0) {
-        return res.status(400).json({ error: 'No valid parameters to update' });
-      }
-
-      updateFields.push('updated_at = NOW()');
-
-      const { rows } = await pool.query(
-        `UPDATE step_counter_params 
-         SET ${updateFields.join(', ')}
-         WHERE collar_id = $1 AND session_id = $2
-         RETURNING *`,
-        updateValues
-      );
-      result = rows[0];
-    }
-
-    // Clear from cache so next chunk will reload fresh params
-    const key = `${collar_id}:${session_id}`;
-    stepCounterBySession.delete(key);
-
-    return res.json({ ok: true, params: result });
-  } catch (err) {
-    console.error('POST /step-counter-params error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /step-counter-params/:collar_id
- * Get step counter parameters for a session
- */
-app.get('/step-counter-params/:collar_id', async (req, res) => {
-  try {
-    const { collar_id } = req.params;
-    let { session_id } = req.query;
-
-    if (!collar_id) {
-      return res.status(400).json({ error: 'collar_id required' });
-    }
-
-    // If no session_id provided, get active session
-    if (!session_id) {
-      session_id = await getActiveSessionForCollar(collar_id);
-      if (!session_id) {
-        return res.status(404).json({ error: 'No active session found for this collar' });
-      }
-    }
-
-    const { rows } = await pool.query(
-      `SELECT * FROM step_counter_params
-       WHERE collar_id = $1 AND session_id = $2
-       LIMIT 1`,
-      [collar_id, session_id]
-    );
-
-    if (rows.length === 0) {
-      // Return defaults if no record exists
-      return res.json({
-        ok: true,
-        params: {
-          collar_id,
-          session_id,
-          peak_threshold: 12.0,
-          peak_window_n: 4,
-          filter_window_size: 5,
-          process_window_samples: 100,
-          run_start_threshold: 30.0,
-          shake_start_threshold: 12.0,
-          sample_rate_hz: 32,
-          valley_window_n: 2,
-          run_end_threshold_high: 20.0,
-          run_end_threshold_low: 12.0,
-          run_peak_valley_diff: 20.0,
-          run_scaling_factor: 2.1,
-          baseline_step_samples: 29,
-          shake_peak_valley_diff: 12.0,
-          shake_regional_peak_max: 39.0,
-          shake_variance_threshold: 10.0,
-          status: 'defaults'
-        }
+      decoded.temp_data.forEach((tempValue, index) => {
+        temperature_list.push({
+          temp_c: tempValue,
+          timestamp: new Date(t0 + index * intervalMs).toISOString()
+        });
       });
     }
 
-    return res.json({ ok: true, params: rows[0], status: 'stored' });
-  } catch (err) {
-    console.error('GET /step-counter-params error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+    const temp_avg = temperature_list.length > 0
+      ? temperature_list.reduce((sum, t) => sum + t.temp_c, 0) / temperature_list.length
+      : null;
 
-/* -----------------------------
-   Config History Routes
-   ----------------------------- */
+    // Send to Firebase using REST API (PUT requests)
+    await fetch(FIREBASE_STEPS_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(steps)
+    });
 
-/**
- * POST /config
- * Insert new config record for a session
- */
-app.post('/config', async (req, res) => {
-  try {
-    const { collar_id, session_id, emissivity, ssid, password, changed_by } = req.body;
+    await fetch(FIREBASE_TEMP_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(temp_avg)
+    });
 
-    if (!collar_id || !session_id) {
-      return res.status(400).json({ error: 'collar_id and session_id required' });
-    }
+    console.log(`[Firebase] Updated Steps=${steps}, Temp=${temp_avg?.toFixed(2)}`);
 
-    // Validate session exists for this collar
-    const isValid = await validateCompositeSession(collar_id, session_id);
-    if (!isValid) {
-      return res.status(404).json({ error: 'Invalid collar_id/session_id combination' });
-    }
-
-    const { rows } = await pool.query(
-      `INSERT INTO collar_config_history 
-       (collar_id, session_id, emissivity, ssid, password, changed_by, changed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
-       RETURNING *`,
-      [collar_id, session_id, emissivity || null, ssid || null, password || null, changed_by || 'api']
-    );
-
-    return res.json({ ok: true, config: rows[0] });
-  } catch (err) {
-    console.error('POST /config error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /config/:collar_id
- * Get latest config for active session (or specific session if session_id provided)
- */
-app.get('/config/:collar_id', async (req, res) => {
-  try {
-    const { collar_id } = req.params;
-    let { session_id } = req.query;
-
-    if (!collar_id) {
-      return res.status(400).json({ error: 'collar_id required' });
-    }
-
-    // If no session_id provided, get active session
-    if (!session_id) {
-      session_id = await getActiveSessionForCollar(collar_id);
-      if (!session_id) {
-        return res.status(404).json({ error: 'No active session found for this collar' });
-      }
-    }
-
-    // Get latest config for the session
-    const { rows } = await pool.query(
-      `SELECT * FROM collar_config_history
-       WHERE collar_id = $1 AND session_id = $2
-       ORDER BY changed_at DESC
-       LIMIT 1`,
-      [collar_id, session_id]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'No config found for this session' });
-    }
-
-    return res.json({ ok: true, config: rows[0], session_id });
-  } catch (err) {
-    console.error('GET /config/:collar_id error', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/* -----------------------------
-   ✅ NEW: Admin & Health Endpoints
-   ----------------------------- */
-
-/**
- * POST /admin/cleanup-sessions
- * Manual cleanup endpoint (only clears MEMORY, not DB)
- */
-app.post('/admin/cleanup-sessions', async (req, res) => {
-  try {
-    const beforeCount = stepCounterBySession.size;
-    cleanupInactiveSessions();
-    const afterCount = stepCounterBySession.size;
-    
     return res.json({
       ok: true,
-      message: 'Memory caches cleared for inactive sessions. All DB records preserved.',
-      sessions_before: beforeCount,
-      sessions_after: afterCount,
-      cleaned_up: beforeCount - afterCount
+      steps: steps,
+      temperature: temp_avg,
+      timestamp: new Date().toISOString()
     });
+
   } catch (err) {
-    console.error('Manual cleanup error', err);
+    console.error("POST /process-chunk error", err);
     return res.status(500).json({ error: err.message });
   }
-});
-
-/**
+});/**
  * GET /health
- * Enhanced health check with memory usage stats
  */
-app.get('/health', async (req, res) => {
+app.get('/health', (req, res) => {
   const memUsage = process.memoryUsage();
-  
-  // Get total sessions in DB
-  let dbSessionCount = 0;
-  try {
-    const { rows } = await pool.query('SELECT COUNT(*) as count FROM collar_sessions');
-    dbSessionCount = parseInt(rows[0].count);
-  } catch (err) {
-    console.error('Error counting DB sessions:', err);
-  }
-  
   res.json({
     ok: true,
     uptime: process.uptime(),
     memory: {
       rss_mb: Math.round(memUsage.rss / 1024 / 1024),
-      heap_used_mb: Math.round(memUsage.heapUsed / 1024 / 1024),
-      heap_total_mb: Math.round(memUsage.heapTotal / 1024 / 1024)
-    },
-    cache: {
-      active_sessions_in_memory: stepCounterBySession.size,
-      tracked_sessions_in_memory: sessionLastAccessTime.size,
-      total_sessions_in_db: dbSessionCount,
-      message: 'Memory caches auto-cleanup after 1 hour inactivity. DB records never deleted.'
-    },
-    active_collars: mappingByCollar.size
+      heap_used_mb: Math.round(memUsage.heapUsed / 1024 / 1024)
+    }
   });
 });
 
@@ -1480,7 +471,5 @@ app.get('/health', async (req, res) => {
    Start server
    ----------------------------- */
 app.listen(PORT, () => {
-  console.log(`Collar backend listening on ${PORT}`);
-  console.log(`Memory cleanup runs every ${SESSION_CLEANUP_INTERVAL_MS / 60000} minutes`);
-  console.log(`Sessions inactive for >${SESSION_INACTIVE_THRESHOLD_MS / 60000} minutes will have memory cleared`);
+  console.log(`Step Counter + Firebase backend listening on port ${PORT}`);
 });
