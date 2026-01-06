@@ -50,7 +50,7 @@ class StepCounter {
     this.PEAK_WINDOW_N = params.peak_window_n || 4;
     this.VALLEY_WINDOW_N = params.valley_window_n || 2;
     this.FILTER_WINDOW_SIZE = params.filter_window_size || 5;
-    this.PROCESS_WINDOW_SAMPLES = params.process_window_samples || 100;
+    this.PROCESS_WINDOW_SAMPLES = params.process_window_samples || 50;
     
     // Running behavior thresholds
     this.RUN_START_THRESHOLD = params.run_start_threshold || 30.0;
@@ -426,11 +426,18 @@ app.post('/process-chunk', async (req, res) => {
       ? temperature_list.reduce((sum, t) => sum + t.temp_c, 0) / temperature_list.length
       : null;
 
+    // Get current steps from Firebase
+    const currentStepsResponse = await fetch(FIREBASE_STEPS_URL);
+    const currentSteps = await currentStepsResponse.json() || 0;
+    
+    // Add new steps to existing total
+    const totalSteps = currentSteps + steps;
+
     // Send to Firebase using REST API (PUT requests)
     await fetch(FIREBASE_STEPS_URL, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(steps)
+      body: JSON.stringify(totalSteps)
     });
 
     await fetch(FIREBASE_TEMP_URL, {
@@ -439,11 +446,11 @@ app.post('/process-chunk', async (req, res) => {
       body: JSON.stringify(temp_avg)
     });
 
-    console.log(`[Firebase] Updated Steps=${steps}, Temp=${temp_avg?.toFixed(2)}`);
+    console.log(`[Firebase] Added ${steps} steps (Total: ${totalSteps}), Temp=${temp_avg?.toFixed(2)}`);
 
     return res.json({
       ok: true,
-      steps: steps,
+      steps: totalSteps,
       temperature: temp_avg,
       timestamp: new Date().toISOString()
     });
@@ -452,7 +459,42 @@ app.post('/process-chunk', async (req, res) => {
     console.error("POST /process-chunk error", err);
     return res.status(500).json({ error: err.message });
   }
-});/**
+});
+
+/**
+ * GET /flush
+ * Reset steps and temperature to 0
+ */
+app.get('/flush', async (req, res) => {
+  try {
+    // Reset both values to 0
+    await fetch(FIREBASE_STEPS_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(0)
+    });
+
+    await fetch(FIREBASE_TEMP_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(0)
+    });
+
+    console.log('[Firebase] Flushed - Steps and Temp reset to 0');
+
+    return res.json({
+      ok: true,
+      message: 'Steps and temperature reset to 0',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (err) {
+    console.error("GET /flush error", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * GET /health
  */
 app.get('/health', (req, res) => {
