@@ -945,35 +945,6 @@ app.put('/chunks', async (req, res) => {
     // Get existing active session
     let session_id = await getActiveSessionForCollar(collar_id);
 
-<<<<<<< HEAD
-    // Get current steps from Firebase
-    const currentStepsResponse = await fetch(FIREBASE_STEPS_URL);
-    const currentSteps = await currentStepsResponse.json() || 0;
-    
-    // Add new steps to existing total
-    const totalSteps = currentSteps + steps;
-
-    // Send to Firebase using REST API (PUT requests)
-    await fetch(FIREBASE_STEPS_URL, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(totalSteps)
-    });
-
-    await fetch(FIREBASE_TEMP_URL, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(temp_avg)
-    });
-
-    console.log(`[Firebase] Added ${steps} steps (Total: ${totalSteps}), Temp=${temp_avg?.toFixed(2)}`);
-
-    return res.json({
-      ok: true,
-      steps: totalSteps,
-      temperature: temp_avg,
-      timestamp: new Date().toISOString()
-=======
     // ✔ Only create new session IF user explicitly asks
     if (new_session === true) {
       // Fetch current dog metadata from collar table
@@ -1097,7 +1068,6 @@ app.put('/chunks', async (req, res) => {
       session_id_used: session_id,
       chunk_id: chunkRow.id,
       outputMetric
->>>>>>> parent of 0cb4933 (removed collar-id and sessions)
     });
 
   } catch (err) {
@@ -1106,43 +1076,6 @@ app.put('/chunks', async (req, res) => {
   }
 });
 
-<<<<<<< HEAD
-/**
- * GET /flush
- * Reset steps and temperature to 0
- */
-app.get('/flush', async (req, res) => {
-  try {
-    // Reset both values to 0
-    await fetch(FIREBASE_STEPS_URL, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(0)
-    });
-
-    await fetch(FIREBASE_TEMP_URL, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(0)
-    });
-
-    console.log('[Firebase] Flushed - Steps and Temp reset to 0');
-
-    return res.json({
-      ok: true,
-      message: 'Steps and temperature reset to 0',
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (err) {
-    console.error("GET /flush error", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /health
-=======
 /* -----------------------------
    ✅ NEW: Session Management Endpoints
    ----------------------------- */
@@ -1150,7 +1083,6 @@ app.get('/flush', async (req, res) => {
 /**
  * GET /sessions/:collar_id
  * List all sessions for a collar (active + inactive)
->>>>>>> parent of 0cb4933 (removed collar-id and sessions)
  */
 app.get('/sessions/:collar_id', async (req, res) => {
   try {
